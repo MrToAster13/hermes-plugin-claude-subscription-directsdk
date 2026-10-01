@@ -41,11 +41,21 @@ def _parse_usage_reset_at(value):
 
 
 def _usage_window(entry):
-    """One ``limits[]`` entry -> an ``AccountUsageWindow`` (ELI-349 Implementation Decisions)."""
+    """One ``limits[]`` entry -> an ``AccountUsageWindow`` (ELI-349 Implementation Decisions).
+
+    Entries from the API are not fully trusted: a malformed ``scope`` or ``scope.model`` (e.g. a
+    string instead of an object) must fall back to the raw kind label, never raise, per the
+    ticket's "do not make the hook raise" instruction.
+    """
     from agent.account_usage import AccountUsageWindow
     kind = entry.get('kind')
-    model_name = ((entry.get('scope') or {}).get('model') or {}).get('display_name')
-    label = _USAGE_KIND_LABELS.get(kind) or (f'{model_name} week' if model_name else kind)
+    scope = entry.get('scope')
+    scope = scope if isinstance(scope, dict) else {}
+    model = scope.get('model')
+    model = model if isinstance(model, dict) else {}
+    model_name = model.get('display_name')
+    model_name = model_name if isinstance(model_name, str) and model_name else None
+    label = _USAGE_KIND_LABELS.get(kind) or (f'{model_name} week' if model_name else kind) or 'unknown'
     percent = entry.get('percent')
     used_percent = float(percent) if isinstance(percent, (int, float)) and not isinstance(percent, bool) else None
     return AccountUsageWindow(label=label, used_percent=used_percent, reset_at=_parse_usage_reset_at(entry.get('resets_at')))
@@ -136,9 +146,10 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
             with httpx.Client(timeout=8.0) as client:
                 response = client.get('https://api.anthropic.com/api/oauth/usage', headers=headers)
                 response.raise_for_status()
-                payload = response.json() or {}
+                payload = response.json()
         except Exception:
             return None
+        payload = payload if isinstance(payload, dict) else {}
         limits = payload.get('limits')
         if not isinstance(limits, list) or not limits:
             return None  # empty/missing limits: ELI-351 fallback scope, not this ticket

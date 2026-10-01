@@ -1,14 +1,16 @@
 """ELI-350: /usage happy path for the Claude Subscription DirectSDK provider.
 
-Single seam: Hermes's ``fetch_account_usage(provider)`` dispatch (which calls the plugin profile's
-``fetch_account_usage`` hook) feeding ``render_account_usage_lines``. Only the HTTP response and the
-Claude Code credentials read are faked; no live network.
+Single seam: Hermes's ``fetch_account_usage(provider)`` dispatch (agent.account_usage, which
+resolves the registered plugin profile and calls its ``fetch_account_usage`` hook under a 10s
+deadline) feeding ``render_account_usage_lines``. Only the HTTP response and the Claude Code
+credentials read are faked; no live network.
 """
 from datetime import datetime, timezone
 
 import pytest
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+PROVIDER_NAME = "claude-subscription-directsdk-experimental"
 
 VALID_CREDS = {
     "accessToken": "cc-access-token",
@@ -91,10 +93,10 @@ def _patch_transport(monkeypatch, *, creds=VALID_CREDS, client_cls=_FakeClient):
 
 
 def test_usage_snapshot_renders_one_line_per_limit_in_api_order(profile, monkeypatch):
-    from agent.account_usage import render_account_usage_lines
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
 
     _patch_transport(monkeypatch)
-    snapshot = profile.fetch_account_usage()
+    snapshot = fetch_account_usage(PROVIDER_NAME)
 
     assert snapshot is not None
     assert snapshot.provider == "claude-subscription-directsdk-experimental"
@@ -127,8 +129,10 @@ def test_usage_snapshot_renders_one_line_per_limit_in_api_order(profile, monkeyp
 
 
 def test_usage_request_shape_is_one_get_with_expected_headers_and_timeout(profile, monkeypatch):
+    from agent.account_usage import fetch_account_usage
+
     _patch_transport(monkeypatch)
-    profile.fetch_account_usage()
+    fetch_account_usage(PROVIDER_NAME)
 
     assert len(_FakeClient.instances) == 1
     client = _FakeClient.instances[0]
@@ -139,10 +143,56 @@ def test_usage_request_shape_is_one_get_with_expected_headers_and_timeout(profil
     assert headers["Authorization"] == "Bearer cc-access-token"
     assert headers["anthropic-beta"] == "oauth-2025-04-20"
     assert headers["Accept"] == "application/json"
-    assert "User-Agent" in headers
+    # Must match Hermes's built-in Anthropic OAuth usage fetcher's User-Agent exactly
+    # (agent/account_usage.py), not merely be present.
+    assert headers["User-Agent"] == "claude-code/2.1.0"
 
 
 def test_usage_hook_never_refreshes_or_writes_credentials(profile, monkeypatch):
     """Scenario 4: the token-refresh path is never called and credentials are never written."""
+    from agent.account_usage import fetch_account_usage
+
     _patch_transport(monkeypatch)
-    profile.fetch_account_usage()  # would raise via _never_called if any forbidden path ran
+    fetch_account_usage(PROVIDER_NAME)  # would raise via _never_called if any forbidden path ran
+
+
+def test_usage_hook_never_raises_on_a_malformed_response(profile, monkeypatch):
+    """The hook must not raise on a malformed response (ticket scope note): a non-dict scope,
+    a non-dict scope.model, or a top-level list body all degrade gracefully instead of dropping
+    the whole /usage block (spec AC2/AC3 for the entries that ARE well-formed)."""
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+    malformed_limits = {
+        "limits": [
+            {"kind": "session", "percent": 10, "resets_at": None},
+            {"kind": "weird_scope", "percent": 20, "resets_at": None, "scope": "global"},
+            {"kind": "weird_model", "percent": 30, "resets_at": None, "scope": {"model": "Fable"}},
+        ],
+    }
+
+    class _MalformedClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse(malformed_limits)
+
+    _patch_transport(monkeypatch, client_cls=_MalformedClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)
+
+    assert snapshot is not None
+    labels = [w.label for w in snapshot.windows]
+    assert labels == ["Current session", "weird_scope", "weird_model"]
+    lines = render_account_usage_lines(snapshot)
+    assert lines  # rendered, did not drop the whole block
+
+
+def test_usage_hook_never_raises_on_a_top_level_list_body(profile, monkeypatch):
+    class _ListBodyClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse([{"kind": "session", "percent": 1}])
+
+    _patch_transport(monkeypatch, client_cls=_ListBodyClient)
+    from agent.account_usage import fetch_account_usage
+
+    snapshot = fetch_account_usage(PROVIDER_NAME)  # must not raise
+    assert snapshot is None  # a list body has no `limits` key: defers like missing/empty limits
