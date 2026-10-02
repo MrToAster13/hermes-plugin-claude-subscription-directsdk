@@ -427,4 +427,112 @@ def test_usage_hook_handles_non_finite_percent_without_raising(profile, monkeypa
 
     lines = render_account_usage_lines(snapshot)  # must not raise (no round() on NaN/inf)
     assert lines[2] == "Current session: 90% remaining (10% used)"
-    assert lines[3] == "Current week: unavailable"
+
+
+# Review round 1 findings (ELI-351): the H2 bug class and the "never raises" guarantee were only
+# applied to the `limits[]` path, not the legacy fallback path added by this same ticket.
+
+
+@pytest.mark.parametrize("bad_utilization", [float("nan"), float("inf"), float("-inf")])
+def test_usage_hook_fallback_handles_non_finite_utilization_without_raising(profile, monkeypatch, bad_utilization):
+    """Same bug class as H2, but in the fallback (legacy-field) branch: core's `_usage_windows`
+    does `float(used)` with no isfinite check, so a NaN/Infinity `utilization` reaches
+    render_account_usage_lines's round() and raises outside the dispatch try. Verified red
+    without the fix: pre-fix this raised ValueError/OverflowError from render_account_usage_lines.
+    """
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+    body = {
+        "five_hour": {"utilization": bad_utilization, "resets_at": None},
+        "seven_day": {"utilization": 0.2, "resets_at": None},
+    }
+
+    class _BadUtilizationClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse(body)
+
+    _patch_transport(monkeypatch, client_cls=_BadUtilizationClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)  # must not raise
+
+    assert snapshot is not None
+    labels = [w.label for w in snapshot.windows]
+    assert labels == ["Current session", "Current week"]
+    used = [w.used_percent for w in snapshot.windows]
+    assert used == [None, 20.0]
+
+    lines = render_account_usage_lines(snapshot)  # must not raise (no round() on NaN/inf)
+    assert lines[2] == "Current session: unavailable"
+    assert lines[3] == "Current week: 80% remaining (20% used)"
+
+
+@pytest.mark.parametrize("bad_window", ["oops", [1, 2]])
+def test_usage_hook_fallback_handles_non_dict_window_without_raising(profile, monkeypatch, bad_window):
+    """The hook must not raise when a legacy window's value isn't a dict (e.g. `five_hour` is a
+    string or a list). Verified red without the fix: pre-fix `_usage_windows`'s `window.get(...)`
+    raised `AttributeError` ('str'/'list' object has no attribute 'get').
+    """
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+    body = {"five_hour": bad_window, "seven_day": {"utilization": 0.3, "resets_at": None}}
+
+    class _BadWindowClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse(body)
+
+    _patch_transport(monkeypatch, client_cls=_BadWindowClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)  # must not raise
+
+    assert snapshot is not None
+    labels = [w.label for w in snapshot.windows]
+    assert labels == ["Current week"]  # the malformed "five_hour" window is dropped, not fabricated
+    assert snapshot.windows[0].used_percent == 30.0
+
+    lines = render_account_usage_lines(snapshot)  # must not raise
+    assert any(line.startswith("Current week:") for line in lines)
+
+
+@pytest.mark.parametrize("bad_utilization", ["abc", [1]])
+def test_usage_hook_fallback_handles_non_numeric_utilization_without_raising(profile, monkeypatch, bad_utilization):
+    """The hook must not raise when `utilization` itself is a non-numeric type (a string that
+    isn't float-able, or a list). Verified red without the fix: pre-fix `float(used)` raised
+    `ValueError`/`TypeError`.
+    """
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+    body = {
+        "five_hour": {"utilization": bad_utilization, "resets_at": None},
+        "seven_day": {"utilization": 0.3, "resets_at": None},
+    }
+
+    class _BadNumericClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse(body)
+
+    _patch_transport(monkeypatch, client_cls=_BadNumericClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)  # must not raise
+
+    assert snapshot is not None
+    labels = [w.label for w in snapshot.windows]
+    assert labels == ["Current week"]  # the malformed "five_hour" window is dropped, not fabricated
+    assert snapshot.windows[0].used_percent == 30.0
+
+    lines = render_account_usage_lines(snapshot)  # must not raise
+    assert any(line.startswith("Current week:") for line in lines)
+
+
+def test_usage_hook_error_non_numeric_expires_at_treated_as_expired(profile, monkeypatch):
+    """core's `is_claude_code_token_valid` does `expires_at - 60_000`, which raises `TypeError`
+    on a non-numeric `expiresAt`. The hook must guard this and treat it as an expired token (no
+    HTTP request, no refresh, no write), not raise. Verified red without the fix: pre-fix this
+    raised TypeError from is_claude_code_token_valid, masked to None by the dispatch.
+    """
+    from agent.account_usage import fetch_account_usage
+
+    bad_creds = {**VALID_CREDS, "expiresAt": "soon"}
+    _patch_transport(monkeypatch, creds=bad_creds)
+    snapshot = fetch_account_usage(PROVIDER_NAME)
+    _assert_unavailable_line(snapshot, _REASON_TOKEN_EXPIRED)
+    assert _FakeClient.instances == []  # malformed expiresAt -> no HTTP request

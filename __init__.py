@@ -80,6 +80,40 @@ def _usage_window(entry):
     return AccountUsageWindow(label=label, used_percent=used_percent, reset_at=_parse_usage_reset_at(entry.get('resets_at')))
 
 
+def _sanitize_legacy_source(payload, keys):
+    """Pre-validate the legacy ``five_hour``/``seven_day``/... fields before handing them to
+    core's ``_usage_windows`` (ELI-351 review round 1 finding 2): that helper assumes
+    ``source[key]`` is a dict and ``source[key][used_key]`` is float-able, and raises
+    (``AttributeError``/``ValueError``/``TypeError``) on a malformed shape, which the dispatch
+    then masks to ``None`` and the whole /usage block disappears. A malformed window (wrong type,
+    or a non-numeric ``utilization``) is dropped here, same as a genuinely absent window: the
+    other, well-formed windows still render.
+    """
+    cleaned = {}
+    for key in keys:
+        window = payload.get(key)
+        if not isinstance(window, dict):
+            continue
+        used = window.get('utilization')
+        if used is not None and (isinstance(used, bool) or not isinstance(used, (int, float))):
+            window = {k: v for k, v in window.items() if k != 'utilization'}
+        cleaned[key] = window
+    return cleaned
+
+
+def _finite_or_none(window):
+    """A NaN/Infinity ``used_percent`` (ELI-351 review round 1 finding 1 — the H2 bug class,
+    reopened in the legacy fallback path) must degrade to ``None`` (renders as ``unavailable``),
+    same as H2 does for ``limits[].percent``: core's ``_usage_windows`` floats the raw value with
+    no isfinite check, and render_account_usage_lines's round() raises on a non-finite float.
+    """
+    import math
+    from dataclasses import replace
+    if window.used_percent is not None and not math.isfinite(window.used_percent):
+        return replace(window, used_percent=None)
+    return window
+
+
 class ClaudeOAuthDirectSDKProfile(ProviderProfile):
     model_metadata = MODEL_METADATA
 
@@ -162,7 +196,13 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
         if not creds or not creds.get('accessToken'):
             return self._usage_unavailable('no Claude Code login found (run `claude` and log in)')
         # expiresAt within 60s (is_claude_code_token_valid's own buffer): no HTTP request at all.
-        if not is_claude_code_token_valid(creds):
+        # A non-numeric expiresAt makes core's own check raise (`'str' - int`, ELI-351 review
+        # round 1 finding 2); treat that the same as an expired token rather than let it raise.
+        try:
+            token_valid = is_claude_code_token_valid(creds)
+        except (TypeError, ValueError):
+            token_valid = False
+        if not token_valid:
             return self._usage_unavailable('token expired (run `claude` once to refresh)')
         token = creds['accessToken']
         headers = {
@@ -200,11 +240,14 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
             # core's own window-building helper on the already-fetched payload. The extra-usage
             # details line is part of the legacy-field fallback only (ELI-349); the `limits` happy
             # path (ELI-350) never surfaces it.
-            windows = tuple(_usage_windows(
-                payload,
-                (('five_hour', 'Current session'), ('seven_day', 'Current week'),
-                 ('seven_day_opus', 'Opus week'), ('seven_day_sonnet', 'Sonnet week')),
-                'utilization', 'resets_at', fraction=True,
+            mapping = (('five_hour', 'Current session'), ('seven_day', 'Current week'),
+                       ('seven_day_opus', 'Opus week'), ('seven_day_sonnet', 'Sonnet week'))
+            # ELI-351 review round 1 findings 1 & 2: sanitize malformed window shapes/types before
+            # core's _usage_windows (which assumes a dict with a float-able utilization), then
+            # degrade any non-finite percent that survives float() to None (same as H2).
+            cleaned = _sanitize_legacy_source(payload, [key for key, _label in mapping])
+            windows = tuple(_finite_or_none(w) for w in _usage_windows(
+                cleaned, mapping, 'utilization', 'resets_at', fraction=True,
             ))
             extra = payload.get('extra_usage')
             extra = extra if isinstance(extra, dict) else {}
