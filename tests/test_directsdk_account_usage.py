@@ -531,7 +531,7 @@ def test_usage_hook_fallback_handles_non_numeric_utilization_without_raising(pro
 # these raised from inside `agent.account_usage._parse_dt`/`_usage_windows`, escaping the
 # plugin's own try/except in `_usage_windows`'s caller and hitting the dispatch's masking
 # `except Exception: return None`, so `snapshot is None` on 07e3fe0 and this test fails there.
-@pytest.mark.parametrize("bad_resets_at", [1790913290000, 1e20, float("nan"), ["x"], {"a": 1}])
+@pytest.mark.parametrize("bad_resets_at", [1790913290000, 1e20, float("nan"), ["x"], {"a": 1}, True, False])
 def test_usage_hook_fallback_handles_malformed_resets_at_without_raising(profile, monkeypatch, bad_resets_at):
     from agent.account_usage import fetch_account_usage, render_account_usage_lines
 
