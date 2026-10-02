@@ -186,13 +186,245 @@ def test_usage_hook_never_raises_on_a_malformed_response(profile, monkeypatch):
 
 
 def test_usage_hook_never_raises_on_a_top_level_list_body(profile, monkeypatch):
+    """H3 (ELI-351): the old assertion (``snapshot is None``) passed with or without a fix because
+    the dispatch's ``except Exception: return None`` masks any crash the same way. ELI-351 gives a
+    non-dict body a real, observable path instead: it degrades to an empty parsed body, which the
+    new fallback renders as a present-but-empty snapshot (not None). Verified red without the
+    ELI-351 fallback: on the ELI-350 code (pre-fallback) a missing/malformed ``limits`` key
+    returned ``None`` unconditionally, so this assertion failed before the fallback was added.
+    """
     class _ListBodyClient(_FakeClient):
         def get(self, url, headers=None):
             self.requests.append((url, headers))
             return _FakeResponse([{"kind": "session", "percent": 1}])
 
     _patch_transport(monkeypatch, client_cls=_ListBodyClient)
-    from agent.account_usage import fetch_account_usage
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
 
     snapshot = fetch_account_usage(PROVIDER_NAME)  # must not raise
-    assert snapshot is None  # a list body has no `limits` key: defers like missing/empty limits
+    assert snapshot is not None
+    assert snapshot.windows == ()
+    assert snapshot.details == ()
+    assert snapshot.unavailable_reason is None
+    lines = render_account_usage_lines(snapshot)  # must not raise either
+    assert lines == ["\U0001F4C8 Claude plan limits", f"Provider: {PROVIDER_NAME}"]
+
+
+# ELI-351 scenario 2 / AC 4: `limits` missing or empty -> fallback to the legacy fields of the
+# SAME response body, one request only.
+FALLBACK_PAYLOAD = {
+    "five_hour": {"utilization": 0.42, "resets_at": "2026-10-01T07:09:00Z"},
+    "seven_day": {"utilization": 0.23, "resets_at": "2026-10-02T06:59:00Z"},
+    "seven_day_opus": {"utilization": 0.05, "resets_at": "2026-10-02T06:59:00Z"},
+    "extra_usage": {"is_enabled": True, "used_credits": 1.5, "monthly_limit": 10.0, "currency": "USD"},
+}
+
+
+@pytest.mark.parametrize("limits_value", [None, [], "missing"])
+def test_usage_hook_fallback_parses_legacy_fields_with_one_request(profile, monkeypatch, limits_value):
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+    body = dict(FALLBACK_PAYLOAD)
+    if limits_value != "missing":
+        body["limits"] = limits_value
+
+    class _FallbackClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse(body)
+
+    _patch_transport(monkeypatch, client_cls=_FallbackClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)
+
+    assert snapshot is not None
+    assert len(_FakeClient.instances) == 1
+    assert len(_FakeClient.instances[0].requests) == 1  # exactly one HTTP request, no second fetch
+
+    labels = [w.label for w in snapshot.windows]
+    assert labels == ["Current session", "Current week", "Opus week"]
+    used = [w.used_percent for w in snapshot.windows]
+    assert used == [42.0, 23.0, 5.0]
+
+    lines = render_account_usage_lines(snapshot)
+    assert any(line.startswith("Current session: 58% remaining (42% used)") for line in lines)
+    assert any("Extra usage: 1.50 / 10.00 USD" == line for line in lines)
+
+
+# ELI-351 scenario 3 / AC 5, AC 6: exact `Unavailable: <reason>` lines, no refresh, no HTTP for
+# the no-login and expired-token cases.
+_REASON_NO_LOGIN = "no Claude Code login found (run `claude` and log in)"
+_REASON_TOKEN_EXPIRED = "token expired (run `claude` once to refresh)"
+_REASON_TOKEN_REJECTED = "token rejected (run `claude` once to refresh)"
+_REASON_UNREADABLE = "usage API returned an unreadable response"
+_REASON_NETWORK = "could not reach the usage API"
+
+
+def _assert_unavailable_line(snapshot, reason):
+    from agent.account_usage import render_account_usage_lines
+
+    assert snapshot is not None
+    assert snapshot.windows == ()
+    assert snapshot.unavailable_reason == reason
+    lines = render_account_usage_lines(snapshot)
+    assert lines.count(f"Unavailable: {reason}") == 1
+    # the rest of /usage still prints: header + provider line are present alongside it.
+    assert lines[0] == "\U0001F4C8 Claude plan limits"
+    assert lines[-1] == f"Unavailable: {reason}"
+
+
+def test_usage_hook_error_no_login(profile, monkeypatch):
+    from agent.account_usage import fetch_account_usage
+
+    _patch_transport(monkeypatch, creds=None)
+    snapshot = fetch_account_usage(PROVIDER_NAME)
+    _assert_unavailable_line(snapshot, _REASON_NO_LOGIN)
+    assert _FakeClient.instances == []  # no HTTP request without a login
+
+
+def test_usage_hook_error_expired_token_makes_no_request(profile, monkeypatch):
+    from agent.account_usage import fetch_account_usage
+
+    expired_creds = {
+        **VALID_CREDS,
+        "expiresAt": int(datetime.now(timezone.utc).timestamp() * 1000) + 30_000,  # within the 60s buffer
+    }
+    _patch_transport(monkeypatch, creds=expired_creds)
+    snapshot = fetch_account_usage(PROVIDER_NAME)
+    _assert_unavailable_line(snapshot, _REASON_TOKEN_EXPIRED)
+    assert _FakeClient.instances == []  # expired -> no HTTP request (AC 6)
+
+
+def _http_status_error(status):
+    import httpx
+    request = httpx.Request("GET", USAGE_URL)
+    response = httpx.Response(status, request=request)
+    return httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_usage_hook_error_http_401_or_403(profile, monkeypatch, status):
+    from agent.account_usage import fetch_account_usage
+
+    class _RejectedResponse(_FakeResponse):
+        def raise_for_status(self):
+            raise _http_status_error(status)
+
+    class _RejectedClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _RejectedResponse(None)
+
+    _patch_transport(monkeypatch, client_cls=_RejectedClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)
+    _assert_unavailable_line(snapshot, _REASON_TOKEN_REJECTED)
+
+
+def test_usage_hook_error_http_500(profile, monkeypatch):
+    from agent.account_usage import fetch_account_usage
+
+    class _ServerErrorResponse(_FakeResponse):
+        def raise_for_status(self):
+            raise _http_status_error(500)
+
+    class _ServerErrorClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _ServerErrorResponse(None)
+
+    _patch_transport(monkeypatch, client_cls=_ServerErrorClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)
+    _assert_unavailable_line(snapshot, "usage API returned HTTP 500")
+
+
+def test_usage_hook_error_timeout(profile, monkeypatch):
+    from agent.account_usage import fetch_account_usage
+
+    class _TimeoutClient(_FakeClient):
+        def get(self, url, headers=None):
+            import httpx
+            raise httpx.TimeoutException("timed out")
+
+    _patch_transport(monkeypatch, client_cls=_TimeoutClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)
+    _assert_unavailable_line(snapshot, _REASON_NETWORK)
+
+
+def test_usage_hook_error_unreadable_body(profile, monkeypatch):
+    from agent.account_usage import fetch_account_usage
+
+    class _UnreadableResponse(_FakeResponse):
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    class _UnreadableClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _UnreadableResponse(None)
+
+    _patch_transport(monkeypatch, client_cls=_UnreadableClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)
+    _assert_unavailable_line(snapshot, _REASON_UNREADABLE)
+
+
+# H1 (ELI-350 review hardening): a non-string, non-hashable `kind` must not raise; valid entries
+# in the same response must still render. Verified red without the fix: pre-fix, `_usage_window`
+# called `_USAGE_KIND_LABELS.get(kind)` with the raw (unhashable) `kind`, raising
+# `TypeError: cannot use 'list' as a dict key`, which escaped render (not the dispatch try) in the
+# case driven at the bottom of this test (exercised here through fetch_account_usage/render,
+# the single seam, never by calling the private `_usage_window` helper directly).
+@pytest.mark.parametrize("bad_kind", [["x"], {"a": 1}])
+def test_usage_hook_handles_non_string_kind_without_raising(profile, monkeypatch, bad_kind):
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+    body = {"limits": [
+        {"kind": "session", "percent": 1, "resets_at": None},
+        {"kind": bad_kind, "percent": 2, "resets_at": None},
+    ]}
+
+    class _BadKindClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse(body)
+
+    _patch_transport(monkeypatch, client_cls=_BadKindClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)  # must not raise
+
+    assert snapshot is not None
+    labels = [w.label for w in snapshot.windows]
+    assert labels[0] == "Current session"
+    assert labels[1] == str(bad_kind)  # coerced, not dropped
+
+    lines = render_account_usage_lines(snapshot)  # must not raise
+    assert any(line.startswith("Current session:") for line in lines)
+
+
+# H2 (ELI-350 review hardening): a NaN/Infinity `percent` must not reach core's
+# render_account_usage_lines (which calls round() and would raise outside the dispatch try); it
+# must render as the standard `unavailable` line, same as a null percent. Verified red without
+# the fix: pre-fix, `_usage_window` accepted any int/float (including NaN/inf) as `used_percent`,
+# and `render_account_usage_lines`'s `round(100 - used)` on a NaN/inf value raises
+# (`ValueError`/`OverflowError`) outside fetch_account_usage's own try/except.
+@pytest.mark.parametrize("bad_percent", [float("nan"), float("inf"), float("-inf")])
+def test_usage_hook_handles_non_finite_percent_without_raising(profile, monkeypatch, bad_percent):
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+    body = {"limits": [
+        {"kind": "session", "percent": 10, "resets_at": None},
+        {"kind": "weekly_all", "percent": bad_percent, "resets_at": None},
+    ]}
+
+    class _BadPercentClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse(body)
+
+    _patch_transport(monkeypatch, client_cls=_BadPercentClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)  # must not raise
+
+    assert snapshot is not None
+    assert snapshot.windows[0].used_percent == 10.0
+    assert snapshot.windows[1].used_percent is None
+
+    lines = render_account_usage_lines(snapshot)  # must not raise (no round() on NaN/inf)
+    assert lines[2] == "Current session: 90% remaining (10% used)"
+    assert lines[3] == "Current week: unavailable"
