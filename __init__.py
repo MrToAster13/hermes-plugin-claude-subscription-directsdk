@@ -81,17 +81,21 @@ def _usage_window(entry):
 
 
 def _sanitize_legacy_resets_at(value):
-    """Drop a legacy ``resets_at`` value that core's ``_parse_dt`` would raise on (ELI-402 review
-    round 2 finding): a list/dict is unhashable and raises ``TypeError`` from ``_parse_dt``'s own
-    ``value in {None, ""}`` check; a non-finite or out-of-range numeric value (NaN, 1e20,
-    epoch-milliseconds such as 1790913290000 which is year 58721) raises ``ValueError`` or
-    ``OverflowError`` from ``datetime.fromtimestamp``. Anything else (``None``, a string, a normal
-    epoch number) is passed through unchanged for core to parse/validate itself.
+    """Drop a legacy ``resets_at`` value that core's ``_parse_dt`` would raise on, or silently
+    mis-render (ELI-402 review round 2 finding; ELI-352 S3 advisory finding (b)): a list/dict is
+    unhashable and raises ``TypeError`` from ``_parse_dt``'s own ``value in {None, ""}`` check; a
+    non-finite or out-of-range numeric value (NaN, 1e20, epoch-milliseconds such as 1790913290000
+    which is year 58721) raises ``ValueError`` or ``OverflowError`` from
+    ``datetime.fromtimestamp``; a bool (``True``/``False``) is a legacy-field type error too — it
+    is not a raise (``bool`` is an ``int`` subclass, so ``_parse_dt`` happily parses it as epoch
+    0 or 1) but a silently wrong reset time, so it is dropped the same way. Anything else
+    (``None``, a string, a normal epoch number) is passed through unchanged for core to
+    parse/validate itself.
     """
     from datetime import datetime, timezone
-    if isinstance(value, (list, dict)):
+    if isinstance(value, (list, dict, bool)):
         return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, (int, float)):
         try:
             datetime.fromtimestamp(float(value), tz=timezone.utc)
         except (ValueError, OverflowError, OSError):
