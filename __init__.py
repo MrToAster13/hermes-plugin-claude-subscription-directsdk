@@ -15,6 +15,51 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# kind -> fixed label (ELI-349 Implementation Decisions). A model-scoped entry (scope.model.display_name
+# set) overrides this with "<display_name> week"; anything else keeps the raw kind string.
+_USAGE_KIND_LABELS = {'session': 'Current session', 'weekly_all': 'Current week'}
+
+
+def _utc_now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+def _parse_usage_reset_at(value):
+    """ISO-8601 ``resets_at`` -> aware UTC datetime, or None (null/invalid)."""
+    from datetime import datetime, timezone
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _usage_window(entry):
+    """One ``limits[]`` entry -> an ``AccountUsageWindow`` (ELI-349 Implementation Decisions).
+
+    Entries from the API are not fully trusted: a malformed ``scope`` or ``scope.model`` (e.g. a
+    string instead of an object) must fall back to the raw kind label, never raise, per the
+    ticket's "do not make the hook raise" instruction.
+    """
+    from agent.account_usage import AccountUsageWindow
+    kind = entry.get('kind')
+    scope = entry.get('scope')
+    scope = scope if isinstance(scope, dict) else {}
+    model = scope.get('model')
+    model = model if isinstance(model, dict) else {}
+    model_name = model.get('display_name')
+    model_name = model_name if isinstance(model_name, str) and model_name else None
+    label = _USAGE_KIND_LABELS.get(kind) or (f'{model_name} week' if model_name else kind) or 'unknown'
+    percent = entry.get('percent')
+    used_percent = float(percent) if isinstance(percent, (int, float)) and not isinstance(percent, bool) else None
+    return AccountUsageWindow(label=label, used_percent=used_percent, reset_at=_parse_usage_reset_at(entry.get('resets_at')))
+
 
 class ClaudeOAuthDirectSDKProfile(ProviderProfile):
     model_metadata = MODEL_METADATA
@@ -76,6 +121,43 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
 
     def build_api_kwargs_extras(self, *, reasoning_config=None, **_):
         return ({'reasoning': dict(reasoning_config)} if reasoning_config else {}), {}
+
+    def fetch_account_usage(self, *, base_url=None, api_key=None):
+        # Read-only: the Claude Code credential reader below never refreshes or writes, and this
+        # hook must never call resolve_anthropic_token (that path can refresh/rotate the token).
+        import httpx
+        from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
+        from agent.anthropic_credentials import is_claude_code_token_valid, read_claude_code_credentials
+
+        creds = read_claude_code_credentials()
+        if not creds or not is_claude_code_token_valid(creds):
+            return None
+        token = creds.get('accessToken')
+        if not token:
+            return None
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'anthropic-beta': 'oauth-2025-04-20',
+            'Accept': 'application/json',
+            # Mirrors Hermes's built-in Anthropic OAuth usage fetcher (agent/account_usage.py).
+            'User-Agent': 'claude-code/2.1.0',
+        }
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                response = client.get('https://api.anthropic.com/api/oauth/usage', headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception:
+            return None
+        payload = payload if isinstance(payload, dict) else {}
+        limits = payload.get('limits')
+        if not isinstance(limits, list) or not limits:
+            return None  # empty/missing limits: ELI-351 fallback scope, not this ticket
+        windows = tuple(_usage_window(entry) for entry in limits if isinstance(entry, dict))
+        return AccountUsageSnapshot(
+            provider=self.name, source='oauth_usage_api', fetched_at=_utc_now(),
+            title='Claude plan limits', windows=windows,
+        )
 
 
 profile = ClaudeOAuthDirectSDKProfile(
