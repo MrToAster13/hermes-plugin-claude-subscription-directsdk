@@ -80,6 +80,25 @@ def _usage_window(entry):
     return AccountUsageWindow(label=label, used_percent=used_percent, reset_at=_parse_usage_reset_at(entry.get('resets_at')))
 
 
+def _sanitize_legacy_resets_at(value):
+    """Drop a legacy ``resets_at`` value that core's ``_parse_dt`` would raise on (ELI-402 review
+    round 2 finding): a list/dict is unhashable and raises ``TypeError`` from ``_parse_dt``'s own
+    ``value in {None, ""}`` check; a non-finite or out-of-range numeric value (NaN, 1e20,
+    epoch-milliseconds such as 1790913290000 which is year 58721) raises ``ValueError`` or
+    ``OverflowError`` from ``datetime.fromtimestamp``. Anything else (``None``, a string, a normal
+    epoch number) is passed through unchanged for core to parse/validate itself.
+    """
+    from datetime import datetime, timezone
+    if isinstance(value, (list, dict)):
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+    return value
+
+
 def _sanitize_legacy_source(payload, keys):
     """Pre-validate the legacy ``five_hour``/``seven_day``/... fields before handing them to
     core's ``_usage_windows`` (ELI-351 review round 1 finding 2): that helper assumes
@@ -87,7 +106,9 @@ def _sanitize_legacy_source(payload, keys):
     (``AttributeError``/``ValueError``/``TypeError``) on a malformed shape, which the dispatch
     then masks to ``None`` and the whole /usage block disappears. A malformed window (wrong type,
     or a non-numeric ``utilization``) is dropped here, same as a genuinely absent window: the
-    other, well-formed windows still render.
+    other, well-formed windows still render. ELI-402: a malformed ``resets_at`` (see
+    ``_sanitize_legacy_resets_at``) is dropped the same way, but only the reset time — the
+    window's ``utilization`` and the rest of the block survive.
     """
     cleaned = {}
     for key in keys:
@@ -97,6 +118,8 @@ def _sanitize_legacy_source(payload, keys):
         used = window.get('utilization')
         if used is not None and (isinstance(used, bool) or not isinstance(used, (int, float))):
             window = {k: v for k, v in window.items() if k != 'utilization'}
+        if 'resets_at' in window and _sanitize_legacy_resets_at(window.get('resets_at')) is None:
+            window = {k: v for k, v in window.items() if k != 'resets_at'}
         cleaned[key] = window
     return cleaned
 
@@ -188,6 +211,7 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
         # ELI-351: on any failure this returns a snapshot with an unavailable_reason (never None,
         # never raises) so /usage prints "Unavailable: <reason>" and the rest of the block still
         # renders. The exact reason strings are ELI-349's (Implementation Decisions, Errors).
+        import math
         import httpx
         from agent.account_usage import AccountUsageSnapshot, _is_num, _usage_windows
         from agent.anthropic_credentials import is_claude_code_token_valid, read_claude_code_credentials
@@ -252,7 +276,10 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
             extra = payload.get('extra_usage')
             extra = extra if isinstance(extra, dict) else {}
             used_credits, monthly_limit = extra.get('used_credits'), extra.get('monthly_limit')
-            if extra.get('is_enabled') and _is_num(used_credits) and _is_num(monthly_limit):
+            # ELI-402: _is_num accepts NaN/Infinity (they are floats); isfinite() keeps a NaN or
+            # infinite value from rendering as "Extra usage: nan" (same bug class as H2/finding 1).
+            if (extra.get('is_enabled') and _is_num(used_credits) and _is_num(monthly_limit)
+                    and math.isfinite(used_credits) and math.isfinite(monthly_limit)):
                 details.append(f'Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {extra.get("currency") or "USD"}')
         return AccountUsageSnapshot(
             provider=self.name, source='oauth_usage_api', fetched_at=_utc_now(),

@@ -523,6 +523,71 @@ def test_usage_hook_fallback_handles_non_numeric_utilization_without_raising(pro
     assert any(line.startswith("Current week:") for line in lines)
 
 
+# ELI-402: a non-string legacy `resets_at` reaches core's `_parse_dt`, which raises
+# (ValueError for epoch-ms, NaN; OverflowError for huge floats; TypeError for unhashable
+# list/dict). The dispatch's `except Exception: return None` masked it and the whole /usage
+# block disappeared. A malformed reset time must drop only that reset time, keeping the
+# window's percentage and the rest of the block. Verified red on 07e3fe0 (pre-fix): each of
+# these raised from inside `agent.account_usage._parse_dt`/`_usage_windows`, escaping the
+# plugin's own try/except in `_usage_windows`'s caller and hitting the dispatch's masking
+# `except Exception: return None`, so `snapshot is None` on 07e3fe0 and this test fails there.
+@pytest.mark.parametrize("bad_resets_at", [1790913290000, 1e20, float("nan"), ["x"], {"a": 1}])
+def test_usage_hook_fallback_handles_malformed_resets_at_without_raising(profile, monkeypatch, bad_resets_at):
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+    body = {
+        "five_hour": {"utilization": 0.1, "resets_at": bad_resets_at},
+        "seven_day": {"utilization": 0.2, "resets_at": "2026-10-02T06:59:00Z"},
+    }
+
+    class _BadResetsAtClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse(body)
+
+    _patch_transport(monkeypatch, client_cls=_BadResetsAtClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)  # must not raise
+
+    assert snapshot is not None
+    labels = [w.label for w in snapshot.windows]
+    assert labels == ["Current session", "Current week"]  # block stays, both windows present
+    used = [w.used_percent for w in snapshot.windows]
+    assert used == [10.0, 20.0]  # percentage kept even though the reset time is dropped
+    assert snapshot.windows[0].reset_at is None  # only the malformed reset time is dropped
+    assert snapshot.windows[1].reset_at is not None  # the well-formed window's reset time survives
+
+    lines = render_account_usage_lines(snapshot)  # must not raise
+    assert lines[2] == "Current session: 90% remaining (10% used)"
+    assert lines[3].startswith("Current week: 80% remaining (20% used) \u2022 resets ")
+
+
+# ELI-402: a NaN/Infinity extra-usage value must render no "Extra usage" line instead of
+# "Extra usage: nan" / "Extra usage: inf". Verified red on 07e3fe0 (pre-fix): `_is_num` accepts
+# NaN/Infinity (they are floats), so the f-string formatted them and "Extra usage: nan" appeared.
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("bad_field", ["used_credits", "monthly_limit"])
+def test_usage_hook_fallback_hides_extra_usage_line_on_non_finite_value(profile, monkeypatch, bad_field, bad_value):
+    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+    extra_usage = {"is_enabled": True, "used_credits": 1.5, "monthly_limit": 10.0, "currency": "USD"}
+    extra_usage[bad_field] = bad_value
+    body = {"five_hour": {"utilization": 0.1, "resets_at": None}, "extra_usage": extra_usage}
+
+    class _BadExtraUsageClient(_FakeClient):
+        def get(self, url, headers=None):
+            self.requests.append((url, headers))
+            return _FakeResponse(body)
+
+    _patch_transport(monkeypatch, client_cls=_BadExtraUsageClient)
+    snapshot = fetch_account_usage(PROVIDER_NAME)  # must not raise
+
+    assert snapshot is not None
+    assert not any(d.startswith("Extra usage") for d in snapshot.details)
+
+    lines = render_account_usage_lines(snapshot)  # must not raise
+    assert not any(line.startswith("Extra usage") for line in lines)
+
+
 def test_usage_hook_error_non_numeric_expires_at_treated_as_expired(profile, monkeypatch):
     """core's `is_claude_code_token_valid` does `expires_at - 60_000`, which raises `TypeError`
     on a non-numeric `expiresAt`. The hook must guard this and treat it as an expired token (no
