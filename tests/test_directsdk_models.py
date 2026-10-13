@@ -18,7 +18,7 @@ EXPECTED = {
 def test_catalog_windows_match_explicit_native_routes(profile):
     from agent.model_metadata import get_model_context_length
     assert set(profile.fallback_models) == set(EXPECTED)
-    assert profile.default_aux_model == 'claude-sonnet-5[1m]'
+    assert profile.default_aux_model == 'claude-opus-5-5[1m]'
     for model, window in EXPECTED.items():
         assert profile.get_model_context_length(model) == window
         assert get_model_context_length(model, provider=profile.name) == window
