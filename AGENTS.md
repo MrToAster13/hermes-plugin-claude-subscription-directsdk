@@ -40,7 +40,14 @@ window and which plans include it; the model table for the minimum CLI version).
    `agent/anthropic_adapter.py` in hermes-agent encodes; if the two disagree, fix both. Open
    question: the docs also say thinking cannot be turned off on Opus 5.5, but whether the API
    400s the disable (as on Fable) or ignores it is unverified; probe before adding it to
-   `MANDATORY_THINKING`.
+   `MANDATORY_THINKING`. Haiku 5.5 is in `MANDATORY_THINKING` because the docs say its thinking
+   cannot be turned off. A 2026-10-20 probe did not reject the disable; that shows only that the
+   disable was not refused, not that it was honored. The probe did not record its CLI version.
+   Title calls the same day recorded CLI 2.1.282 (ELI-564 postpatch_title.log), below the
+   documented 2.1.293 minimum. hermes-agent does not match yet: `_MANDATORY_THINKING_CLAUDE_SUBSTRINGS`
+   in `agent/anthropic_adapter.py` lacks `claude-haiku-5-5`, and with reasoning on the same file
+   sends no `thinking` for any model id containing `haiku`. Fixing that is a hermes-agent
+   follow-up.
 4. `tests/test_directsdk_models.py::EXPECTED` — one row per route, window included. The test
    drives the fake CLI and checks the argv Hermes actually sends.
 5. `README.md` → Requirements: the minimum Claude Code version the model needs.
