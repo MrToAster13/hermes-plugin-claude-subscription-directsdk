@@ -223,7 +223,7 @@ class Contract(unittest.TestCase):
         )
         self.assertEqual(adaptive["thinking"], {"type": "adaptive"})
         self.assertEqual(adaptive["output_config"], {"effort": "medium"})
-        for route in ("haiku", "claude-haiku-4-5", "claude-haiku-4-5-20251001"):
+        for route in ("claude-haiku-4-5", "claude-haiku-4-5-20251001"):
             # Haiku 4.5 answers `adaptive thinking is not supported on this model` with a 400.
             haiku = json.loads(
                 directsdk.request_body(
@@ -236,12 +236,33 @@ class Contract(unittest.TestCase):
             directsdk.request_body(
                 {
                     **self.request(),
-                    "model": "haiku",
+                    "model": "claude-haiku-4-5",
                     "extra_body": {"reasoning": {"enabled": False}},
                 }
             )[0]
         )
         self.assertEqual(off["thinking"], {"type": "disabled"})
+        for route in ("haiku", "claude-haiku-5-5", "claude-haiku-5-5[1m]"):
+            # Haiku 5.5 takes adaptive thinking. The docs say its thinking cannot be turned off, so
+            # a caller's disable is omitted, as for Fable.
+            on = json.loads(
+                directsdk.request_body(
+                    {**self.request(), "model": route, "extra_body": enabled}
+                )[0]
+            )
+            self.assertEqual(on["thinking"], {"type": "adaptive"})
+            self.assertEqual(on["output_config"], {"effort": "medium"})
+            off = json.loads(
+                directsdk.request_body(
+                    {
+                        **self.request(),
+                        "model": route,
+                        "extra_body": {"reasoning": {"enabled": False}},
+                    }
+                )[0]
+            )
+            self.assertNotIn("thinking", off)
+            self.assertNotIn("context_management", off)
         schema = {
             "type": "object",
             "properties": {"title": {"type": "string"}},
