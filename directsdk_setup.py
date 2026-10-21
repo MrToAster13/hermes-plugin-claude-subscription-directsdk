@@ -83,7 +83,7 @@ def discover_models(command=None, env=None, timeout=40):
     gate = Admission("https://api.anthropic.com", timeout)
     try:
         child["ANTHROPIC_BASE_URL"] = gate.url
-        argv = resolved + ["-p", "--model", "sonnet", "--input-format", "stream-json", "--output-format", "stream-json",
+        argv = resolved + ["-p", "--model", "haiku", "--input-format", "stream-json", "--output-format", "stream-json",
                            "--verbose", "--tools", "", "--setting-sources", "", "--strict-mcp-config",
                            "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands", "--no-session-persistence"]
         handshake = json.dumps({"type": "control_request", "request_id": "hermes-picker",
