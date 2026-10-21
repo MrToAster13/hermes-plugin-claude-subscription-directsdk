@@ -51,7 +51,7 @@ Native Claude Code **2.1.263** is qualified. Replay acknowledgments and extra-bo
 
 ```sh
 claude auth login
-hermes --provider claude-subscription-directsdk-experimental -m sonnet
+hermes --provider claude-subscription-directsdk-experimental -m opus
 ```
 
 Authentication belongs to the official CLI. The plugin never opens, copies, refreshes, or prints its credential files. No Hermes API key is required or sent by the plugin. The normal Hermes client path rejects inherited API-key, custom Anthropic endpoint, and cloud-backend overrides before spawning; the error names conflicting environment variables without printing their values. Remove those overrides from the launching environment when selecting OAuth. There is no silent HTTP/API-key fallback in this client.
@@ -72,8 +72,10 @@ Persistent configuration:
 ```yaml
 model:
   provider: claude-subscription-directsdk-experimental
-  default: sonnet
+  default: opus
 ```
+
+`opus` routes to `claude-opus-5-5[1m]`, which draws usage credits on a Pro plan (see Model metadata and accounting below).
 
 Auxiliary/fallback routing remains owned by Hermes. Configure those routes explicitly if they must also use the subscription; this provider does not silently change other selected providers.
 
