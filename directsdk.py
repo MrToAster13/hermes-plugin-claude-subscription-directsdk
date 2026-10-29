@@ -291,6 +291,46 @@ def request_body(kwargs):
     return encoded, manifest, names
 
 
+STDERR_TAIL_BYTES = 4096
+
+
+class StderrTail(threading.Thread):
+    """Drain a child's stderr and keep only its last STDERR_TAIL_BYTES bytes.
+
+    Draining stops a chatty child from blocking on a full pipe. The tail is what explains a
+    child that exits without stream-json output: a rejected flag, a Node start failure, a
+    config error.
+    """
+
+    def __init__(self, stream):
+        super().__init__(daemon=True)
+        self._stream, self._tail, self._lock = stream, bytearray(), threading.Lock()
+
+    def run(self):
+        try:
+            while chunk := self._stream.read1(65536):
+                with self._lock:
+                    self._tail += chunk
+                    del self._tail[:-STDERR_TAIL_BYTES]
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def retained(self):
+        with self._lock:
+            return len(self._tail)
+
+    def text(self):
+        with self._lock:
+            return self._tail.decode('utf-8', 'replace').strip()
+
+    def annotate(self, message):
+        """`message` plus the stderr tail, once the child has closed stderr or a second has passed."""
+        self.join(timeout=1)
+        tail = self.text()
+        return message + ('; native stderr: ' + tail if tail else '')
+
+
 class Request:
     def __init__(self, client):
         self.client, self.process = client, None
@@ -632,7 +672,9 @@ class Client:
                 effort = parsed.get('output_config', {}).get('effort')
                 if effort:
                     command += ['--effort', effort]
-                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8', cwd=self._workdir(), env=env)
+                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', cwd=self._workdir(), env=env)
+                stderr_tail = StderrTail(p.stderr.buffer)
+                stderr_tail.start()
                 events = queue.Queue()
                 def read():
                     try:
@@ -675,7 +717,7 @@ class Client:
                         while True:
                             ack = receive()
                             if ack is None:
-                                raise RuntimeError('Native exited before replay acknowledgment')
+                                raise RuntimeError(stderr_tail.annotate('Native exited before replay acknowledgment'))
                             if ack.get('type') == 'result':
                                 if ack.get('num_turns') != 0 or ack.get('is_error'):
                                     raise RuntimeError('Native history replay not supported: expected zero-turn acknowledgment')
@@ -729,7 +771,7 @@ class Client:
                         raise ClaudeCodeLoggedOut(f'{LOGGED_OUT_HINT} (native: {native_error})')
                     raise ClaudeAPIError('Native API error: ' + native_error, NATIVE_ERROR_STATUS.get(str(native_error_code)))
                 if len(results) != 1 or not assistants or not stopped:
-                    raise RuntimeError('Incomplete native response: assistant, message_stop and one result required')
+                    raise RuntimeError(stderr_tail.annotate('Incomplete native response: assistant, message_stop and one result required'))
                 final = results[0]
                 blocks = [b for a in assistants for b in a['content']]
                 calls = []
@@ -746,7 +788,7 @@ class Client:
                         calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and p.returncode == 1
                 if not boundary and not native_failure_handled and (p.returncode != 0 or final.get('is_error') or final.get('subtype') != 'success'):
-                    raise RuntimeError('Native request failed: ' + str(final.get('subtype')))
+                    raise RuntimeError(stderr_tail.annotate('Native request failed: ' + str(final.get('subtype'))))
                 usage = assistants[0]['usage'] if admission.used else final.get('usage')
                 if not isinstance(usage, dict) or not all(isinstance(usage.get(k), (int, float)) for k in ('input_tokens', 'output_tokens')):
                     raise RuntimeError('Native result missing complete token usage')
