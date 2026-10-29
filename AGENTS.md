@@ -100,7 +100,9 @@ That ref and `HERMES_SHA` in hermes-mac-config `docker/build-base.sh` change tog
 `upstream-canary.yml` runs weekly against upstream main and never on a PR, so it warns of
 upstream drift without blocking merges. New tests must not call private (`_`-prefixed) Hermes
 names; drive the plugin through the message dicts and provider profile Hermes hands it.
-`tests/test_directsdk_admission.py` still imports `_StreamingCall` and `_ToolCallAccumulator`.
+Two upstream tests still import private names: `tests/test_directsdk_admission.py` imports
+`_StreamingCall` and `_ToolCallAccumulator`, and `tests/test_directsdk_vision.py` imports
+`tools.vision_tools._native_tool_result_images`. A Hermes rename can still break those two.
 
 ## Contributor PRs
 
