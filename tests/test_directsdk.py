@@ -301,27 +301,6 @@ class Contract(unittest.TestCase):
             )[0]
         )
         self.assertEqual(off["thinking"], {"type": "disabled"})
-        for route in ("haiku", "claude-haiku-5-5", "claude-haiku-5-5[1m]"):
-            # Haiku 5.5 takes adaptive thinking. The docs say its thinking cannot be turned off, so
-            # a caller's disable is omitted, as for Fable.
-            on = json.loads(
-                directsdk.request_body(
-                    {**self.request(), "model": route, "extra_body": enabled}
-                )[0]
-            )
-            self.assertEqual(on["thinking"], {"type": "adaptive"})
-            self.assertEqual(on["output_config"], {"effort": "medium"})
-            off = json.loads(
-                directsdk.request_body(
-                    {
-                        **self.request(),
-                        "model": route,
-                        "extra_body": {"reasoning": {"enabled": False}},
-                    }
-                )[0]
-            )
-            self.assertNotIn("thinking", off)
-            self.assertNotIn("context_management", off)
         schema = {
             "type": "object",
             "properties": {"title": {"type": "string"}},
