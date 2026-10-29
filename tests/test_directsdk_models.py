@@ -20,7 +20,9 @@ EXPECTED = {
 def test_catalog_windows_match_explicit_native_routes(profile):
     from agent.model_metadata import get_model_context_length
     assert set(profile.fallback_models) == set(EXPECTED)
-    assert profile.default_aux_model == 'claude-sonnet-5[1m]'
+    assert profile.default_aux_model == 'claude-haiku-5-5'
+    # The bare aux id must still budget at the pinned 1M window, not the 200K unpinned default.
+    assert profile.get_model_context_length(profile.default_aux_model) == 1_000_000
     for model, window in EXPECTED.items():
         assert profile.get_model_context_length(model) == window
         assert get_model_context_length(model, provider=profile.name) == window
@@ -35,8 +37,8 @@ def test_native_argv_enables_only_known_long_context_models(profile, tmp_path):
     native = tmp_path / 'native.py'
     native.write_text(FAKE.replace('rows=[]', "pathlib.Path(os.environ['ARGV_CAPTURE']).write_text(json.dumps(sys.argv))\nrows=[]"))
     aliases = {'sonnet':'claude-sonnet-5-5[1m]', 'opus':'claude-opus-5-5[1m]',
-               'haiku':'claude-haiku-5-5[1m]', 'claude-haiku-4-5':'claude-haiku-4-5-20251001',
-               'fable':'claude-fable-5-1[1m]',
+               'haiku':'claude-haiku-5-5[1m]', 'claude-haiku-5-5':'claude-haiku-5-5[1m]',
+               'claude-haiku-4-5':'claude-haiku-4-5-20251001', 'fable':'claude-fable-5-1[1m]',
                'unqualified-future-model':'unqualified-future-model'}
     with_client = profile.create_client(command=[sys.executable,str(native)], env={'PATH':os.defpath,'HOME':str(tmp_path),'ARGV_CAPTURE':str(capture)})
     try:
@@ -79,6 +81,7 @@ def test_haiku_5_5_never_receives_the_thinking_disable():
         assert 'thinking' not in body(route, {'enabled': False}), route
         assert 'context_management' not in body(route, {'enabled': False}), route
         assert body(route, {'enabled': True, 'effort': 'medium'})['thinking'] == {'type': 'adaptive'}, route
+        assert body(route, {'enabled': True, 'effort': 'medium'})['output_config'] == {'effort': 'medium'}, route
     for route in ('claude-haiku-4-5', 'claude-haiku-4-5-20251001'):
         assert body(route, {'enabled': False})['thinking'] == {'type': 'disabled'}, route
         assert 'thinking' not in body(route, {'enabled': True, 'effort': 'medium'}), route
