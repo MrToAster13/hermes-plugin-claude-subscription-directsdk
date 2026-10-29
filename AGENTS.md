@@ -6,6 +6,16 @@ loopback relay, on the user's Claude subscription. `model_catalog.py` is the pin
 `admission.py` is the single-request gate. Tests import Hermes core from a checkout
 (`HERMES_AGENT_REPO`, default `~/.hermes/hermes-agent`).
 
+## This fork is a contribution staging area
+
+`MrToAster13/hermes-plugin-claude-subscription-directsdk` is Elijah's fork. It is not a deployed
+source: hosts install the plugin from the Hermes plugin catalog
+(`hermes plugins install claude-subscription-directsdk`), which follows upstream, now
+`NousResearch/hermes-official-plugins`. Work here goes upstream as a PR. Merge upstream main
+into the fork (never reset or force-push) before starting a branch, so the fork carries one
+copy of each feature, upstream's. Fork-only changes are the ELI-564 non-Sonnet defaults, the
+CI pin and these agent notes.
+
 ## Invariant: Hermes core never guesses a window for a route we serve
 
 Native Claude Code runs a plain model id inside its 200K gateway default and selects the 1M
@@ -36,11 +46,11 @@ window and which plans include it; the model table for the minimum CLI version).
    window from the docs. Do not copy a window from a sibling model.
 2. `ALIASES` — move the family alias (`opus`, `sonnet`, `fable`, `haiku`) when the docs move it.
 3. `MANDATORY_THINKING` / `NO_ADAPTIVE_THINKING` if the docs say thinking cannot be turned off
-   or adaptive thinking 400s (Fable and Haiku 4.5 today). Mirror what
-   `agent/anthropic_adapter.py` in hermes-agent encodes; if the two disagree, fix both. Open
-   question: the docs also say thinking cannot be turned off on Opus 5.5, but whether the API
-   400s the disable (as on Fable) or ignores it is unverified; probe before adding it to
-   `MANDATORY_THINKING`.
+   or adaptive thinking 400s (mandatory: Fable, Opus 5.5, Sonnet 5.5 and Haiku 5.5; no adaptive:
+   Haiku 4.5 today). Mirror what `agent/anthropic_adapter.py` in hermes-agent encodes; if the two
+   disagree, fix both. Opus 5.5 was settled by #22: the docs say thinking cannot be turned off
+   there and the API 400s the disable exactly as on Fable. Core's
+   `_MANDATORY_THINKING_CLAUDE_SUBSTRINGS` still needs the Haiku 5.5 entry.
 4. `tests/test_directsdk_models.py::EXPECTED` — one row per route, window included. The test
    drives the fake CLI and checks the argv Hermes actually sends.
 5. `README.md` → Requirements: the minimum Claude Code version the model needs.
@@ -88,8 +98,9 @@ the known red. In the fork (`MrToAster13/hermes-plugin-claude-subscription-direc
 `tests.yml` runs against the hermes-agent commit the minipc container runs, pinned by `ref:`.
 That ref and `HERMES_SHA` in hermes-mac-config `docker/build-base.sh` change together.
 `upstream-canary.yml` runs weekly against upstream main and never on a PR, so it warns of
-upstream drift without blocking merges. Tests must not call private (`_`-prefixed) Hermes
+upstream drift without blocking merges. New tests must not call private (`_`-prefixed) Hermes
 names; drive the plugin through the message dicts and provider profile Hermes hands it.
+`tests/test_directsdk_admission.py` still imports `_StreamingCall` and `_ToolCallAccumulator`.
 
 ## Contributor PRs
 

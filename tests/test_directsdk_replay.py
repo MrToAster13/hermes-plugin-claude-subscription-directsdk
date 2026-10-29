@@ -16,20 +16,6 @@ native = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(native)
 
 
-def _shrink_tool_call_args(history, index):
-    """Edit a stored tool call the way a host transform does, through the message dict only.
-
-    Hermes hands the plugin OpenAI-format messages, and any host step (compression, hooks) may
-    rewrite them. The contract under test is that dict shape, so this helper edits it directly
-    instead of calling a private hermes-agent method that can be renamed or removed.
-    """
-    fn = history[index]["tool_calls"][0]["function"]
-    args = json.loads(fn["arguments"])
-    args["content"] = args["content"][:200] + "...[truncated]"
-    fn["arguments"] = json.dumps(args)
-    return True
-
-
 def test_host_history_edits_replay_canonical_visible_blocks():
     msg = {"role": "assistant", "content": "Writing.", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": "x", "content": "a" * 3000})}}]}
     blocks = [{"type": "thinking", "thinking": "private", "signature": "opaque"}, {"type": "text", "text": "Writing."}, {"type": "tool_use", "id": "t1", "name": native.PREFIX + "write_file", "input": {"path": "x", "content": "a" * 3000}}]
@@ -37,16 +23,32 @@ def test_host_history_edits_replay_canonical_visible_blocks():
     history = [{"role": "user", "content": "write"}, msg, {"role": "tool", "tool_call_id": "t1", "content": "ok"}]
     original = copy.deepcopy(history)
     assert native.prepare_history(history)[1][1]["message"]["content"] == blocks
-    assert _shrink_tool_call_args(history, 1)
+    # Hermes compaction keeps tool-call arguments byte-exact and only demotes tool-result bodies, so the
+    # signed native blocks must survive it verbatim.
+    history[2]["content"] = "[tool result demoted]"
+    assert native.prepare_history(history)[1][1]["message"]["content"] == blocks
+    # Hooks still own visible assistant content: an edit must drop the stale signed thinking and replay
+    # canonical text and tool_use built from the host message.
+    history[1]["content"] = "Hook replacement"
     frame = native.prepare_history(history)[1][1]["message"]
     assert [b["type"] for b in frame["content"]] == ["text", "tool_use"]
+    assert frame["content"][0]["text"] == "Hook replacement"
     assert frame["content"][-1]["input"] == json.loads(history[1]["tool_calls"][0]["function"]["arguments"])
-    history[1]["content"] = "Hook replacement"
-    assert native.prepare_history(history)[1][1]["message"]["content"][0]["text"] == "Hook replacement"
     assert history[1]["reasoning_details"] == original[1]["reasoning_details"]
     history[1]["reasoning_details"][0]["version"] = 999
     with pytest.raises(ValueError, match="version"):
         native.prepare_history(history)
+
+
+def test_edited_history_replays_a_call_outside_the_inventory_by_its_own_name():
+    # Hermes answered a directly-called deferred tool with its unknown-tool error (#39); after a
+    # host edit, rebuilt history must not rename it into the mcp__hermes__ namespace.
+    calls = [{"id": "t1", "type": "function", "function": {"name": "mcp__fastmail__draft_email", "arguments": "{}"}},
+             {"id": "t2", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}]
+    history = [{"role": "user", "content": "draft"}, {"role": "assistant", "content": "Drafting.", "tool_calls": calls},
+               {"role": "tool", "tool_call_id": "t1", "content": "unknown"}, {"role": "tool", "tool_call_id": "t2", "content": "ok"}]
+    blocks = native.prepare_history(history, {"write_file"})[1][1]["message"]["content"]
+    assert [b["name"] for b in blocks if b["type"] == "tool_use"] == ["mcp__fastmail__draft_email", native.PREFIX + "write_file"]
 
 
 def test_active_stream_outlives_idle_budget_and_large_request_uses_files(tmp_path):
