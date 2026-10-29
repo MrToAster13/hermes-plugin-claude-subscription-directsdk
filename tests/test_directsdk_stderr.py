@@ -65,3 +65,23 @@ def test_stderr_tail_memory_stays_bounded():
 def test_silent_child_error_is_unchanged(tmp_path):
     client = _client(tmp_path, 'import sys\nsys.stdin.read()\nsys.exit(1)\n')
     assert _error(client, False) == 'Incomplete native response: assistant, message_stop and one result required'
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+def test_child_stderr_pipe_is_closed_after_the_request(tmp_path, monkeypatch, streaming):
+    spawned = []
+    spawn = directsdk.Request.spawn
+
+    def record(self, *args, **kwargs):
+        spawned.append(spawn(self, *args, **kwargs))
+        return spawned[-1]
+
+    monkeypatch.setattr(directsdk.Request, 'spawn', record)
+    client = _client(tmp_path, (
+        'import sys\n'
+        'sys.stdin.read()\n'
+        'sys.stderr.write("error: unknown option --bogus-flag\\n")\n'
+        'sys.exit(1)\n'))
+    _error(client, streaming)
+    assert len(spawned) == 1
+    assert spawned[0].stderr.closed

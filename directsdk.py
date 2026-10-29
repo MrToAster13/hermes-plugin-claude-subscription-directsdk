@@ -623,6 +623,7 @@ class Client:
     def _run(self, request, kwargs, body, manifest, names, system, frames):
         p = None
         reader = None
+        stderr_tail = None
         try:
             timeout = kwargs.get('timeout', self.timeout)
             timeout = getattr(timeout, 'read', timeout)
@@ -835,7 +836,14 @@ class Client:
                 p.wait(timeout=5)
                 if reader is not None:
                     reader.join(timeout=5)
-                for pipe in (p.stdin, p.stdout):
+                pipes = [p.stdin, p.stdout]
+                # Closing stderr while StderrTail sits in read1 can block on the buffer lock,
+                # so close it only once the thread has seen EOF.
+                if stderr_tail is not None:
+                    stderr_tail.join(timeout=1)
+                    if not stderr_tail.is_alive():
+                        pipes.append(p.stderr)
+                for pipe in pipes:
                     if pipe and not pipe.closed:
                         pipe.close()
             with self._lock:
