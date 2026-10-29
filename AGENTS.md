@@ -6,15 +6,32 @@ loopback relay, on the user's Claude subscription. `model_catalog.py` is the pin
 `admission.py` is the single-request gate. Tests import Hermes core from a checkout
 (`HERMES_AGENT_REPO`, default `~/.hermes/hermes-agent`).
 
-## This fork is a contribution staging area
+## This fork is frozen; new work starts in hermes-official-plugins
 
-`MrToAster13/hermes-plugin-claude-subscription-directsdk` is Elijah's fork. It is not a deployed
-source: hosts install the plugin from the Hermes plugin catalog
-(`hermes plugins install claude-subscription-directsdk`), which follows upstream, now
-`NousResearch/hermes-official-plugins`. Work here goes upstream as a PR. Merge upstream main
-into the fork (never reset or force-push) before starting a branch, so the fork carries one
-copy of each feature, upstream's. Fork-only changes are the ELI-564 non-Sonnet defaults, the
-CI pin and these agent notes.
+`MrToAster13/hermes-plugin-claude-subscription-directsdk` is Elijah's fork of
+`NousResearch/hermes-plugin-claude-subscription-directsdk`. That repo is archived: its last
+commit, bfe6d9f, says the plugin moved, and it takes no pushes or PRs. The live upstream is
+`NousResearch/hermes-official-plugins`, path `claude-subscription-directsdk/`. Hosts install the
+plugin from the Hermes plugin catalog (`hermes plugins install claude-subscription-directsdk`),
+which follows that repo, not this fork.
+
+Merging the old `upstream` remote into this fork does nothing now, and a branch of this fork
+cannot become a PR upstream because hermes-official-plugins keeps the plugin in a subdirectory.
+So this fork is frozen. Do not start new work here. Start it in a fork of
+`NousResearch/hermes-official-plugins` and open the PR there.
+
+Fork-only changes that upstream lacks (the ELI-564 non-Sonnet defaults, the ELI-681 stderr
+tail) reach upstream as ported patches:
+
+```
+git -C <this fork> format-patch -1 <sha> -o /tmp/port
+git -C <hermes-official-plugins fork> am --directory=claude-subscription-directsdk /tmp/port/*.patch
+```
+
+Resolve conflicts against upstream's current code, which already has fixes this fork lacks
+(memory and account context #195/#196, summarized thinking display, streaming opt-in). The CI
+pin and these agent notes stay here. The sections below on pin bumps and merge gates describe
+the archived repo's process; check them against hermes-official-plugins before you rely on them.
 
 ## Invariant: Hermes core never guesses a window for a route we serve
 

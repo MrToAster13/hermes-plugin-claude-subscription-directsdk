@@ -2,7 +2,7 @@
 > **This repo has moved.** Claude Subscription DirectSDK now lives in [**NousResearch/hermes-official-plugins**](https://github.com/NousResearch/hermes-official-plugins/tree/main/claude-subscription-directsdk), the single home for Nous Research's official Hermes Agent plugins, with this repo's full history. Open issues and PRs were moved there. Catalog installs follow automatically on `hermes plugins update claude-subscription-directsdk-experimental`; if you installed by URL, run `hermes plugins install claude-subscription-directsdk --force` once.
 
 > [!NOTE]
-> This copy is the fork `MrToAster13/hermes-plugin-claude-subscription-directsdk`, a staging area for upstream PRs. Install from the Hermes plugin catalog or the upstream repo above, not from this fork.
+> This copy is the fork `MrToAster13/hermes-plugin-claude-subscription-directsdk`, and it is frozen. Its upstream, `NousResearch/hermes-plugin-claude-subscription-directsdk`, is archived. Install from the Hermes plugin catalog or from hermes-official-plugins above, not from this fork. New work starts in a fork of hermes-official-plugins.
 
 # Claude Subscription DirectSDK (Experimental) — Hermes plugin
 
