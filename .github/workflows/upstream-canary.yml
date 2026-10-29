@@ -1,0 +1,32 @@
+name: upstream-canary
+
+# Runs the suite against upstream hermes-agent main, not the pinned commit in tests.yml.
+# It never runs on a PR, so it cannot block a merge. A red run here means upstream changed
+# something the plugin relies on; bump the pin in tests.yml and hermes-mac-config together
+# once the plugin is fixed.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install hermes-agent
+        run: python -m pip install -e ./hermes-agent pytest
+      - name: Run the plugin suite against upstream main
+        working-directory: plugin
+        env:
+          HERMES_AGENT_REPO: ${{ github.workspace }}/hermes-agent
+        run: python -m pytest -q

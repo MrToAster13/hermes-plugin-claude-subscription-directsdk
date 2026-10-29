@@ -6,6 +6,33 @@ loopback relay, on the user's Claude subscription. `model_catalog.py` is the pin
 `admission.py` is the single-request gate. Tests import Hermes core from a checkout
 (`HERMES_AGENT_REPO`, default `~/.hermes/hermes-agent`).
 
+## This fork is frozen; new work starts in hermes-official-plugins
+
+`MrToAster13/hermes-plugin-claude-subscription-directsdk` is Elijah's fork of
+`NousResearch/hermes-plugin-claude-subscription-directsdk`. That repo is archived: its last
+commit, bfe6d9f, says the plugin moved, and it takes no pushes or PRs. The live upstream is
+`NousResearch/hermes-official-plugins`, path `claude-subscription-directsdk/`. Hosts install the
+plugin from the Hermes plugin catalog (`hermes plugins install claude-subscription-directsdk`),
+which follows that repo, not this fork.
+
+Merging the old `upstream` remote into this fork does nothing now, and a branch of this fork
+cannot become a PR upstream because hermes-official-plugins keeps the plugin in a subdirectory.
+So this fork is frozen. Do not start new work here. Start it in a fork of
+`NousResearch/hermes-official-plugins` and open the PR there.
+
+Fork-only changes that upstream lacks (the ELI-564 non-Sonnet defaults, the ELI-681 stderr
+tail) reach upstream as ported patches:
+
+```
+git -C <this fork> format-patch -1 <sha> -o /tmp/port
+git -C <hermes-official-plugins fork> am --directory=claude-subscription-directsdk /tmp/port/*.patch
+```
+
+Resolve conflicts against upstream's current code, which already has fixes this fork lacks
+(memory and account context #195/#196, summarized thinking display, streaming opt-in). The CI
+pin and these agent notes stay here. The sections below on pin bumps and merge gates describe
+the archived repo's process; check them against hermes-official-plugins before you rely on them.
+
 ## Invariant: Hermes core never guesses a window for a route we serve
 
 Native Claude Code runs a plain model id inside its 200K gateway default and selects the 1M
@@ -36,11 +63,11 @@ window and which plans include it; the model table for the minimum CLI version).
    window from the docs. Do not copy a window from a sibling model.
 2. `ALIASES` — move the family alias (`opus`, `sonnet`, `fable`, `haiku`) when the docs move it.
 3. `MANDATORY_THINKING` / `NO_ADAPTIVE_THINKING` if the docs say thinking cannot be turned off
-   or adaptive thinking 400s (Fable and Haiku 4.5 today). Mirror what
-   `agent/anthropic_adapter.py` in hermes-agent encodes; if the two disagree, fix both. Open
-   question: the docs also say thinking cannot be turned off on Opus 5.5, but whether the API
-   400s the disable (as on Fable) or ignores it is unverified; probe before adding it to
-   `MANDATORY_THINKING`.
+   or adaptive thinking 400s (mandatory: Fable, Opus 5.5, Sonnet 5.5 and Haiku 5.5; no adaptive:
+   Haiku 4.5 today). Mirror what `agent/anthropic_adapter.py` in hermes-agent encodes; if the two
+   disagree, fix both. Opus 5.5 was settled by #22: the docs say thinking cannot be turned off
+   there and the API 400s the disable exactly as on Fable. Core's
+   `_MANDATORY_THINKING_CLAUDE_SUBSTRINGS` still needs the Haiku 5.5 entry.
 4. `tests/test_directsdk_models.py::EXPECTED` — one row per route, window included. The test
    drives the fake CLI and checks the argv Hermes actually sends.
 5. `README.md` → Requirements: the minimum Claude Code version the model needs.
@@ -79,6 +106,20 @@ CI runs the suite on ubuntu, macOS and Windows. Gate a merge on
 (8 = still pending), never on a `statusCheckRollup` grep: lanes that have not started have no
 row, so "no pending rows" reads ubuntu-passed as all-green while macOS and Windows are queued.
 After the train, `gh run watch <id> --exit-status` on main.
+
+Never merge on a red or pending check, in this fork or upstream. A failure that looks unrelated
+still blocks the merge: fix it on its own branch first, or the next real regression hides behind
+the known red. In the fork (`MrToAster13/hermes-plugin-claude-subscription-directsdk`), gate on
+`gh pr checks <n> --repo MrToAster13/hermes-plugin-claude-subscription-directsdk` exiting 0.
+
+`tests.yml` runs against the hermes-agent commit the minipc container runs, pinned by `ref:`.
+That ref and `HERMES_SHA` in hermes-mac-config `docker/build-base.sh` change together.
+`upstream-canary.yml` runs weekly against upstream main and never on a PR, so it warns of
+upstream drift without blocking merges. New tests must not call private (`_`-prefixed) Hermes
+names; drive the plugin through the message dicts and provider profile Hermes hands it.
+Two upstream tests still import private names: `tests/test_directsdk_admission.py` imports
+`_StreamingCall` and `_ToolCallAccumulator`, and `tests/test_directsdk_vision.py` imports
+`tools.vision_tools._native_tool_result_images`. A Hermes rename can still break those two.
 
 ## Contributor PRs
 
