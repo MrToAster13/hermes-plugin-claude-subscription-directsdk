@@ -80,6 +80,17 @@ CI runs the suite on ubuntu, macOS and Windows. Gate a merge on
 row, so "no pending rows" reads ubuntu-passed as all-green while macOS and Windows are queued.
 After the train, `gh run watch <id> --exit-status` on main.
 
+Never merge on a red or pending check, in this fork or upstream. A failure that looks unrelated
+still blocks the merge: fix it on its own branch first, or the next real regression hides behind
+the known red. In the fork (`MrToAster13/hermes-plugin-claude-subscription-directsdk`), gate on
+`gh pr checks <n> --repo MrToAster13/hermes-plugin-claude-subscription-directsdk` exiting 0.
+
+`tests.yml` runs against the hermes-agent commit the minipc container runs, pinned by `ref:`.
+That ref and `HERMES_SHA` in hermes-mac-config `docker/build-base.sh` change together.
+`upstream-canary.yml` runs weekly against upstream main and never on a PR, so it warns of
+upstream drift without blocking merges. Tests must not call private (`_`-prefixed) Hermes
+names; drive the plugin through the message dicts and provider profile Hermes hands it.
+
 ## Contributor PRs
 
 Teknium is the only merge arbiter. Verify a PR's premise against the vendor docs and a real

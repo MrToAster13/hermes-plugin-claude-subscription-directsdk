@@ -16,16 +16,28 @@ native = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(native)
 
 
-def test_host_history_edits_replay_canonical_visible_blocks():
-    from agent.context_compressor import ContextCompressor
+def _shrink_tool_call_args(history, index):
+    """Edit a stored tool call the way a host transform does, through the message dict only.
 
+    Hermes hands the plugin OpenAI-format messages, and any host step (compression, hooks) may
+    rewrite them. The contract under test is that dict shape, so this helper edits it directly
+    instead of calling a private hermes-agent method that can be renamed or removed.
+    """
+    fn = history[index]["tool_calls"][0]["function"]
+    args = json.loads(fn["arguments"])
+    args["content"] = args["content"][:200] + "...[truncated]"
+    fn["arguments"] = json.dumps(args)
+    return True
+
+
+def test_host_history_edits_replay_canonical_visible_blocks():
     msg = {"role": "assistant", "content": "Writing.", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": "x", "content": "a" * 3000})}}]}
     blocks = [{"type": "thinking", "thinking": "private", "signature": "opaque"}, {"type": "text", "text": "Writing."}, {"type": "tool_use", "id": "t1", "name": native.PREFIX + "write_file", "input": {"path": "x", "content": "a" * 3000}}]
     msg["reasoning_details"] = [{"type": native.CARRIER, "version": 1, "projection": native.projection(msg), "messages": [{"role": "assistant", "content": blocks}]}]
     history = [{"role": "user", "content": "write"}, msg, {"role": "tool", "tool_call_id": "t1", "content": "ok"}]
     original = copy.deepcopy(history)
     assert native.prepare_history(history)[1][1]["message"]["content"] == blocks
-    assert ContextCompressor._truncate_tool_call_args_at(history, 1)
+    assert _shrink_tool_call_args(history, 1)
     frame = native.prepare_history(history)[1][1]["message"]
     assert [b["type"] for b in frame["content"]] == ["text", "tool_use"]
     assert frame["content"][-1]["input"] == json.loads(history[1]["tool_calls"][0]["function"]["arguments"])
