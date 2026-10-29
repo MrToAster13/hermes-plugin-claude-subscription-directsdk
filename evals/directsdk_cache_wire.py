@@ -182,6 +182,6 @@ def run(binary, model):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
-    parser.add_argument("--model", default="claude-sonnet-5")
+    parser.add_argument("--model", default="claude-haiku-5-5")
     args = parser.parse_args()
     print(json.dumps(run(args.binary.resolve(), args.model), indent=2))

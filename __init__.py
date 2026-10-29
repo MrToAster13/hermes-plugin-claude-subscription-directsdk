@@ -1,19 +1,102 @@
 """Claude Subscription DirectSDK (Experimental) — standalone Hermes model-provider registration."""
+from datetime import datetime, timezone
 import logging
+import math
 import os
+import shutil
 
 from providers import register_provider
 from providers.base import ProviderProfile
 
 # Dual import: the Hermes loader imports this directory as a package; the flat test path does not.
 try:
-    from .model_catalog import ALIASES, MODEL_METADATA, native_model
+    from .model_catalog import ALIASES, MODEL_METADATA, MODEL_CAPABILITIES, native_model
     from .directsdk_setup import INSTALL_HINT, _resolve
 except ImportError:
-    from model_catalog import ALIASES, MODEL_METADATA, native_model
+    from model_catalog import ALIASES, MODEL_METADATA, MODEL_CAPABILITIES, native_model
     from directsdk_setup import INSTALL_HINT, _resolve
 
 logger = logging.getLogger(__name__)
+
+# Core checks `process_command` with a PATH-only `shutil.which` before this plugin is asked, so a CLI found only in
+# an install prefix is handed over as its absolute path; a PATH hit keeps the bare name and follows PATH.
+_found = _resolve(None, os.environ)
+_process_command = 'claude' if _found is None or shutil.which('claude') else _found[0]
+
+
+USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+# A `limits[]` kind maps to a fixed label; a model-scoped limit reads "<model> week" (Fable's own
+# weekly limit); any other kind keeps its raw name so a new limit still shows.
+LIMIT_LABELS = {'session': 'Current session', 'weekly_all': 'Current week'}
+# The older top-level windows, for a response without `limits` (core's Anthropic fetcher reads these).
+LEGACY_WINDOWS = (('five_hour', 'Current session'), ('seven_day', 'Current week'),
+                  ('seven_day_opus', 'Opus week'), ('seven_day_sonnet', 'Sonnet week'))
+
+
+def _percent(value, fraction=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return value * 100.0 if fraction and value <= 1 else float(value)
+
+
+def _reset_at(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def usage_windows(payload):
+    """`/api/oauth/usage` body -> (windows, detail lines). Untrusted shapes degrade, never raise."""
+    from agent.account_usage import AccountUsageWindow
+    limits = payload.get('limits')
+    limits = [entry for entry in limits if isinstance(entry, dict)] if isinstance(limits, list) else []
+    if limits:
+        windows = []
+        for entry in limits:
+            kind = entry.get('kind')
+            scope = entry.get('scope') if isinstance(entry.get('scope'), dict) else {}
+            model = scope.get('model') if isinstance(scope.get('model'), dict) else {}
+            name = model.get('display_name')
+            label = (LIMIT_LABELS.get(kind) if isinstance(kind, str) else None) or (
+                f'{name} week' if isinstance(name, str) and name else str(kind or 'unknown'))
+            windows.append(AccountUsageWindow(label=label, used_percent=_percent(entry.get('percent')),
+                                              reset_at=_reset_at(entry.get('resets_at'))))
+        return windows, []
+    windows = []
+    for key, label in LEGACY_WINDOWS:
+        window = payload.get(key)
+        used = _percent(window.get('utilization'), fraction=True) if isinstance(window, dict) else None
+        if used is not None:
+            windows.append(AccountUsageWindow(label=label, used_percent=used, reset_at=_reset_at(window.get('resets_at'))))
+    extra = payload.get('extra_usage') if isinstance(payload.get('extra_usage'), dict) else {}
+    spent, cap = _percent(extra.get('used_credits')), _percent(extra.get('monthly_limit'))
+    details = [f"Extra usage: {spent:.2f} / {cap:.2f} {extra.get('currency') or 'USD'}"] if (
+        extra.get('is_enabled') and spent is not None and cap is not None) else []
+    return windows, details
+
+
+def _subscription_token():
+    """The OAuth token native runs on, read-only: `CLAUDE_CODE_OAUTH_TOKEN`, else the Claude Code login.
+
+    Never core's `resolve_anthropic_token`: it refreshes an expired login, and Claude's refresh
+    tokens are single-use, so a refresh here would race native's own and can log the user out.
+    """
+    from agent.anthropic_credentials import is_claude_code_token_valid, read_claude_code_credentials
+    token = os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '').strip()
+    if token:
+        return token, None
+    creds = read_claude_code_credentials()
+    if not creds or not creds.get('accessToken'):
+        return None, 'no Claude Code login found (run `claude` and log in)'
+    try:
+        valid = is_claude_code_token_valid(creds)
+    except (TypeError, ValueError):
+        valid = False
+    return (creds['accessToken'], None) if valid else (None, 'token expired (run `claude` once to refresh)')
 
 
 class ClaudeOAuthDirectSDKProfile(ProviderProfile):
@@ -77,6 +160,46 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
     def build_api_kwargs_extras(self, *, reasoning_config=None, **_):
         return ({'reasoning': dict(reasoning_config)} if reasoning_config else {}), {}
 
+    def fetch_account_usage(self, *, base_url=None, api_key=None):
+        """`/usage` plan limits: one GET, and every failure is an `Unavailable:` line, never a raise."""
+        import httpx
+        from agent.account_usage import AccountUsageSnapshot
+
+        def snapshot(windows=(), details=(), reason=None):
+            return AccountUsageSnapshot(provider=self.name, source='oauth_usage_api', fetched_at=datetime.now(timezone.utc),
+                                        title='Claude plan limits', windows=tuple(windows), details=tuple(details),
+                                        unavailable_reason=reason)
+
+        token, reason = _subscription_token()
+        if not token:
+            return snapshot(reason=reason)
+        headers = {'Authorization': f'Bearer {token}', 'anthropic-beta': 'oauth-2025-04-20',
+                   'Accept': 'application/json', 'User-Agent': 'claude-code/2.1.0'}
+        try:
+            # Under core's 10 s hook deadline, so a slow API still prints a reason.
+            with httpx.Client(timeout=8.0) as client:
+                response = client.get(USAGE_URL, headers=headers)
+        except httpx.HTTPError:
+            return snapshot(reason='could not reach the usage API')
+        if response.status_code in (401, 403):
+            return snapshot(reason='token rejected (run `claude` once to refresh)')
+        if not 200 <= response.status_code < 300:
+            return snapshot(reason=f'usage API returned HTTP {response.status_code}')
+        try:
+            payload = response.json()
+        except ValueError:
+            return snapshot(reason='usage API returned an unreadable response')
+        return snapshot(*usage_windows(payload if isinstance(payload, dict) else {}))
+
+
+def classify_api_error(error, **_):
+    # Hermes' stale-call watchdog stops a hung call through Client.cancel(), so its kill comes back as our cancel
+    # error, which Hermes would retry as unknown: classify it as the timeout it is. A user interrupt never arrives
+    # as this error; Hermes marks its request cancelled first, drops ours and raises InterruptedError.
+    if isinstance(error, RuntimeError) and str(error) == 'Claude request cancelled':
+        return {'reason': 'timeout'}
+    return None
+
 
 profile = ClaudeOAuthDirectSDKProfile(
     name='claude-subscription-directsdk-experimental',
@@ -85,19 +208,24 @@ profile = ClaudeOAuthDirectSDKProfile(
     api_mode='chat_completions',
     auth_type='external_process',
     supports_health_check=False,
+    # Per-model only: the profile-wide supports_vision would also flip computer_use screenshots
+    # for unpinned ids to native, where the executor still treats them as text-only.
+    model_capabilities=MODEL_CAPABILITIES,
     native_reasoning_details_type='claude-subscription-directsdk-experimental.native_assistant',
     env_vars=(),
     base_url='process://claude-subscription-directsdk-experimental',
-    process_command='claude',
+    process_command=_process_command,
     process_args=(),
     process_command_env_vars=('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND',),
-    default_aux_model='claude-sonnet-5[1m]',
+    default_aux_model='claude-haiku-5-5',
     fallback_models=tuple(MODEL_METADATA),
     model_aliases={alias: native_model(alias) for alias in ALIASES},
+    # A dataclass field (Hermes >= 0.21.4), so a method on the subclass would be shadowed by its None default.
+    classify_api_error=classify_api_error,
 )
 register_provider(profile)
 
 # The provider stays registered when Claude Code is missing so `hermes model` can show the
 # install hint; the request path (`directsdk.Client`) refuses with the same message.
-if _resolve(None, os.environ) is None:
+if _found is None:
     logger.warning("%s: %s", profile.display_name, INSTALL_HINT)

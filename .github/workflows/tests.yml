@@ -21,9 +21,13 @@ jobs:
         with:
           path: plugin
       # The plugin imports Hermes core (providers, agent) from a checkout, the way an installed plugin does.
+      # Pinned to the hermes-agent commit the minipc container runs. Change this ref and
+      # HERMES_SHA in hermes-mac-config docker/build-base.sh together, in the same day.
+      # upstream-canary.yml runs the suite against upstream main on a schedule.
       - uses: actions/checkout@v4
         with:
           repository: NousResearch/hermes-agent
+          ref: 3eb7ed08d19da393196722d0b219b2ba1ec22810
           path: hermes-agent
       # Hermes core gates every runtime dependency on python_version >= '3.14'; older Pythons install none of them.
       - uses: actions/setup-python@v5
