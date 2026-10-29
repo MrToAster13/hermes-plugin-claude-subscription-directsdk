@@ -6,6 +6,7 @@ import sys
 from test_directsdk import FAKE
 
 EXPECTED = {
+    'claude-sonnet-5-5[1m]': 1_000_000,
     'claude-sonnet-5[1m]': 1_000_000,
     'claude-haiku-5-5[1m]': 1_000_000,
     'claude-haiku-4-5-20251001': 200_000,
@@ -35,7 +36,7 @@ def test_native_argv_enables_only_known_long_context_models(profile, tmp_path):
     capture = tmp_path / 'argv.json'
     native = tmp_path / 'native.py'
     native.write_text(FAKE.replace('rows=[]', "pathlib.Path(os.environ['ARGV_CAPTURE']).write_text(json.dumps(sys.argv))\nrows=[]"))
-    aliases = {'sonnet':'claude-sonnet-5[1m]', 'opus':'claude-opus-5-5[1m]',
+    aliases = {'sonnet':'claude-sonnet-5-5[1m]', 'opus':'claude-opus-5-5[1m]',
                'haiku':'claude-haiku-5-5[1m]', 'claude-haiku-5-5':'claude-haiku-5-5[1m]',
                'claude-haiku-4-5':'claude-haiku-4-5-20251001', 'fable':'claude-fable-5-1[1m]',
                'unqualified-future-model':'unqualified-future-model'}
@@ -48,3 +49,38 @@ def test_native_argv_enables_only_known_long_context_models(profile, tmp_path):
             assert argv[argv.index('--model')+1] == expected and '--effort' not in argv
     finally:
         with_client.close()
+
+
+def test_sonnet_5_5_never_receives_the_thinking_disable():
+    """Sonnet 5.5 answers ``thinking: {type: disabled}`` with a 400 (docs: thinking can't be turned
+    off; lowest setting is ``between_tools``). `sonnet` now resolves to it, so Hermes' reasoning-off
+    calls (title generation, ``/reasoning none``) must omit the disable on every spelling, while
+    plain Sonnet 5, which still accepts it, keeps receiving it."""
+    import directsdk
+    def body(model):
+        return json.loads(directsdk.request_body({
+            'model': model, 'messages': [{'role': 'user', 'content': 'go'}],
+            'extra_body': {'reasoning': {'enabled': False}}})[0])
+    for route in ('sonnet', 'claude-sonnet-5-5', 'claude-sonnet-5-5[1m]'):
+        assert 'thinking' not in body(route), route
+        assert 'context_management' not in body(route), route
+    for route in ('claude-sonnet-5', 'claude-sonnet-5[1m]'):
+        assert body(route)['thinking'] == {'type': 'disabled'}, route
+
+
+def test_haiku_5_5_never_receives_the_thinking_disable():
+    """The docs say thinking can't be turned off on Haiku 5.5, and `haiku` now resolves to it, so
+    reasoning-off calls must omit the disable on every spelling. Haiku 5.5 does take adaptive
+    thinking, unlike Haiku 4.5, which keeps receiving the disable and never gets adaptive."""
+    import directsdk
+    def body(model, reasoning):
+        return json.loads(directsdk.request_body({
+            'model': model, 'messages': [{'role': 'user', 'content': 'go'}],
+            'extra_body': {'reasoning': reasoning}})[0])
+    for route in ('haiku', 'claude-haiku-5-5', 'claude-haiku-5-5[1m]'):
+        assert 'thinking' not in body(route, {'enabled': False}), route
+        assert 'context_management' not in body(route, {'enabled': False}), route
+        assert body(route, {'enabled': True, 'effort': 'medium'})['thinking'] == {'type': 'adaptive'}, route
+    for route in ('claude-haiku-4-5', 'claude-haiku-4-5-20251001'):
+        assert body(route, {'enabled': False})['thinking'] == {'type': 'disabled'}, route
+        assert 'thinking' not in body(route, {'enabled': True, 'effort': 'medium'}), route

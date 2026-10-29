@@ -1,144 +1,102 @@
 """Claude Subscription DirectSDK (Experimental) — standalone Hermes model-provider registration."""
+from datetime import datetime, timezone
 import logging
+import math
 import os
+import shutil
 
 from providers import register_provider
 from providers.base import ProviderProfile
 
 # Dual import: the Hermes loader imports this directory as a package; the flat test path does not.
 try:
-    from .model_catalog import ALIASES, MODEL_METADATA, native_model
+    from .model_catalog import ALIASES, MODEL_METADATA, MODEL_CAPABILITIES, native_model
     from .directsdk_setup import INSTALL_HINT, _resolve
 except ImportError:
-    from model_catalog import ALIASES, MODEL_METADATA, native_model
+    from model_catalog import ALIASES, MODEL_METADATA, MODEL_CAPABILITIES, native_model
     from directsdk_setup import INSTALL_HINT, _resolve
 
 logger = logging.getLogger(__name__)
 
-# kind -> fixed label (ELI-349 Implementation Decisions). A model-scoped entry (scope.model.display_name
-# set) overrides this with "<display_name> week"; anything else keeps the raw kind string.
-_USAGE_KIND_LABELS = {'session': 'Current session', 'weekly_all': 'Current week'}
+# Core checks `process_command` with a PATH-only `shutil.which` before this plugin is asked, so a CLI found only in
+# an install prefix is handed over as its absolute path; a PATH hit keeps the bare name and follows PATH.
+_found = _resolve(None, os.environ)
+_process_command = 'claude' if _found is None or shutil.which('claude') else _found[0]
 
 
-def _utc_now():
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc)
+USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+# A `limits[]` kind maps to a fixed label; a model-scoped limit reads "<model> week" (Fable's own
+# weekly limit); any other kind keeps its raw name so a new limit still shows.
+LIMIT_LABELS = {'session': 'Current session', 'weekly_all': 'Current week'}
+# The older top-level windows, for a response without `limits` (core's Anthropic fetcher reads these).
+LEGACY_WINDOWS = (('five_hour', 'Current session'), ('seven_day', 'Current week'),
+                  ('seven_day_opus', 'Opus week'), ('seven_day_sonnet', 'Sonnet week'))
 
 
-def _parse_usage_reset_at(value):
-    """ISO-8601 ``resets_at`` -> aware UTC datetime, or None (null/invalid)."""
-    from datetime import datetime, timezone
+def _percent(value, fraction=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return value * 100.0 if fraction and value <= 1 else float(value)
+
+
+def _reset_at(value):
     if not isinstance(value, str) or not value.strip():
         return None
-    text = value.strip()
-    if text.endswith('Z'):
-        text = text[:-1] + '+00:00'
     try:
-        parsed = datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _usage_window(entry):
-    """One ``limits[]`` entry -> an ``AccountUsageWindow`` (ELI-349 Implementation Decisions).
-
-    Entries from the API are not fully trusted: a malformed ``scope`` or ``scope.model`` (e.g. a
-    string instead of an object) must fall back to the raw kind label, never raise, per the
-    ticket's "do not make the hook raise" instruction.
-
-    H1 (ELI-351 hardening): ``kind`` can be a non-string, non-hashable value (a list or a dict),
-    which would raise ``TypeError: unhashable type`` on a bare ``dict.get(kind)`` lookup. Only a
-    string ``kind`` is used as the label-table key; anything else falls back to ``str(kind)``.
-    H2 (ELI-351 hardening): ``percent`` can be NaN or Infinity (``json.loads`` accepts both); core's
-    ``render_account_usage_lines`` calls ``round()`` on ``used_percent`` and raises on a non-finite
-    float, so a non-finite percent must degrade to ``None`` (renders as "unavailable") here.
-    """
-    import math
+def usage_windows(payload):
+    """`/api/oauth/usage` body -> (windows, detail lines). Untrusted shapes degrade, never raise."""
     from agent.account_usage import AccountUsageWindow
-    kind = entry.get('kind')
-    kind_label = kind if isinstance(kind, str) else None
-    scope = entry.get('scope')
-    scope = scope if isinstance(scope, dict) else {}
-    model = scope.get('model')
-    model = model if isinstance(model, dict) else {}
-    model_name = model.get('display_name')
-    model_name = model_name if isinstance(model_name, str) and model_name else None
-    label = _USAGE_KIND_LABELS.get(kind_label) if kind_label else None
-    if label is None:
-        if model_name:
-            label = f'{model_name} week'
-        elif kind_label:
-            label = kind_label
-        elif kind is not None:
-            label = str(kind)
-        else:
-            label = 'unknown'
-    percent = entry.get('percent')
-    is_number = isinstance(percent, (int, float)) and not isinstance(percent, bool)
-    used_percent = float(percent) if is_number and math.isfinite(percent) else None
-    return AccountUsageWindow(label=label, used_percent=used_percent, reset_at=_parse_usage_reset_at(entry.get('resets_at')))
-
-
-def _sanitize_legacy_resets_at(value):
-    """Drop a legacy ``resets_at`` value that core's ``_parse_dt`` would raise on, or silently
-    mis-render (ELI-402 review round 2 finding; ELI-352 S3 advisory finding (b)): a list/dict is
-    unhashable and raises ``TypeError`` from ``_parse_dt``'s own ``value in {None, ""}`` check; a
-    non-finite or out-of-range numeric value (NaN, 1e20, epoch-milliseconds such as 1790913290000
-    which is year 58721) raises ``ValueError`` or ``OverflowError`` from
-    ``datetime.fromtimestamp``; a bool (``True``/``False``) is a legacy-field type error too — it
-    is not a raise (``bool`` is an ``int`` subclass, so ``_parse_dt`` happily parses it as epoch
-    0 or 1) but a silently wrong reset time, so it is dropped the same way. Anything else
-    (``None``, a string, a normal epoch number) is passed through unchanged for core to
-    parse/validate itself.
-    """
-    from datetime import datetime, timezone
-    if isinstance(value, (list, dict, bool)):
-        return None
-    if isinstance(value, (int, float)):
-        try:
-            datetime.fromtimestamp(float(value), tz=timezone.utc)
-        except (ValueError, OverflowError, OSError):
-            return None
-    return value
-
-
-def _sanitize_legacy_source(payload, keys):
-    """Pre-validate the legacy ``five_hour``/``seven_day``/... fields before handing them to
-    core's ``_usage_windows`` (ELI-351 review round 1 finding 2): that helper assumes
-    ``source[key]`` is a dict and ``source[key][used_key]`` is float-able, and raises
-    (``AttributeError``/``ValueError``/``TypeError``) on a malformed shape, which the dispatch
-    then masks to ``None`` and the whole /usage block disappears. A malformed window (wrong type,
-    or a non-numeric ``utilization``) is dropped here, same as a genuinely absent window: the
-    other, well-formed windows still render. ELI-402: a malformed ``resets_at`` (see
-    ``_sanitize_legacy_resets_at``) is dropped the same way, but only the reset time — the
-    window's ``utilization`` and the rest of the block survive.
-    """
-    cleaned = {}
-    for key in keys:
+    limits = payload.get('limits')
+    limits = [entry for entry in limits if isinstance(entry, dict)] if isinstance(limits, list) else []
+    if limits:
+        windows = []
+        for entry in limits:
+            kind = entry.get('kind')
+            scope = entry.get('scope') if isinstance(entry.get('scope'), dict) else {}
+            model = scope.get('model') if isinstance(scope.get('model'), dict) else {}
+            name = model.get('display_name')
+            label = (LIMIT_LABELS.get(kind) if isinstance(kind, str) else None) or (
+                f'{name} week' if isinstance(name, str) and name else str(kind or 'unknown'))
+            windows.append(AccountUsageWindow(label=label, used_percent=_percent(entry.get('percent')),
+                                              reset_at=_reset_at(entry.get('resets_at'))))
+        return windows, []
+    windows = []
+    for key, label in LEGACY_WINDOWS:
         window = payload.get(key)
-        if not isinstance(window, dict):
-            continue
-        used = window.get('utilization')
-        if used is not None and (isinstance(used, bool) or not isinstance(used, (int, float))):
-            window = {k: v for k, v in window.items() if k != 'utilization'}
-        if 'resets_at' in window and _sanitize_legacy_resets_at(window.get('resets_at')) is None:
-            window = {k: v for k, v in window.items() if k != 'resets_at'}
-        cleaned[key] = window
-    return cleaned
+        used = _percent(window.get('utilization'), fraction=True) if isinstance(window, dict) else None
+        if used is not None:
+            windows.append(AccountUsageWindow(label=label, used_percent=used, reset_at=_reset_at(window.get('resets_at'))))
+    extra = payload.get('extra_usage') if isinstance(payload.get('extra_usage'), dict) else {}
+    spent, cap = _percent(extra.get('used_credits')), _percent(extra.get('monthly_limit'))
+    details = [f"Extra usage: {spent:.2f} / {cap:.2f} {extra.get('currency') or 'USD'}"] if (
+        extra.get('is_enabled') and spent is not None and cap is not None) else []
+    return windows, details
 
 
-def _finite_or_none(window):
-    """A NaN/Infinity ``used_percent`` (ELI-351 review round 1 finding 1 — the H2 bug class,
-    reopened in the legacy fallback path) must degrade to ``None`` (renders as ``unavailable``),
-    same as H2 does for ``limits[].percent``: core's ``_usage_windows`` floats the raw value with
-    no isfinite check, and render_account_usage_lines's round() raises on a non-finite float.
+def _subscription_token():
+    """The OAuth token native runs on, read-only: `CLAUDE_CODE_OAUTH_TOKEN`, else the Claude Code login.
+
+    Never core's `resolve_anthropic_token`: it refreshes an expired login, and Claude's refresh
+    tokens are single-use, so a refresh here would race native's own and can log the user out.
     """
-    import math
-    from dataclasses import replace
-    if window.used_percent is not None and not math.isfinite(window.used_percent):
-        return replace(window, used_percent=None)
-    return window
+    from agent.anthropic_credentials import is_claude_code_token_valid, read_claude_code_credentials
+    token = os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '').strip()
+    if token:
+        return token, None
+    creds = read_claude_code_credentials()
+    if not creds or not creds.get('accessToken'):
+        return None, 'no Claude Code login found (run `claude` and log in)'
+    try:
+        valid = is_claude_code_token_valid(creds)
+    except (TypeError, ValueError):
+        valid = False
+    return (creds['accessToken'], None) if valid else (None, 'token expired (run `claude` once to refresh)')
 
 
 class ClaudeOAuthDirectSDKProfile(ProviderProfile):
@@ -202,93 +160,45 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
     def build_api_kwargs_extras(self, *, reasoning_config=None, **_):
         return ({'reasoning': dict(reasoning_config)} if reasoning_config else {}), {}
 
-    def _usage_unavailable(self, reason):
-        from agent.account_usage import AccountUsageSnapshot
-        return AccountUsageSnapshot(
-            provider=self.name, source='oauth_usage_api', fetched_at=_utc_now(),
-            title='Claude plan limits', unavailable_reason=reason,
-        )
-
     def fetch_account_usage(self, *, base_url=None, api_key=None):
-        # Read-only: the Claude Code credential reader below never refreshes or writes, and this
-        # hook must never call resolve_anthropic_token (that path can refresh/rotate the token).
-        # ELI-351: on any failure this returns a snapshot with an unavailable_reason (never None,
-        # never raises) so /usage prints "Unavailable: <reason>" and the rest of the block still
-        # renders. The exact reason strings are ELI-349's (Implementation Decisions, Errors).
-        import math
+        """`/usage` plan limits: one GET, and every failure is an `Unavailable:` line, never a raise."""
         import httpx
-        from agent.account_usage import AccountUsageSnapshot, _is_num, _usage_windows
-        from agent.anthropic_credentials import is_claude_code_token_valid, read_claude_code_credentials
+        from agent.account_usage import AccountUsageSnapshot
 
-        creds = read_claude_code_credentials()
-        if not creds or not creds.get('accessToken'):
-            return self._usage_unavailable('no Claude Code login found (run `claude` and log in)')
-        # expiresAt within 60s (is_claude_code_token_valid's own buffer): no HTTP request at all.
-        # A non-numeric expiresAt makes core's own check raise (`'str' - int`, ELI-351 review
-        # round 1 finding 2); treat that the same as an expired token rather than let it raise.
+        def snapshot(windows=(), details=(), reason=None):
+            return AccountUsageSnapshot(provider=self.name, source='oauth_usage_api', fetched_at=datetime.now(timezone.utc),
+                                        title='Claude plan limits', windows=tuple(windows), details=tuple(details),
+                                        unavailable_reason=reason)
+
+        token, reason = _subscription_token()
+        if not token:
+            return snapshot(reason=reason)
+        headers = {'Authorization': f'Bearer {token}', 'anthropic-beta': 'oauth-2025-04-20',
+                   'Accept': 'application/json', 'User-Agent': 'claude-code/2.1.0'}
         try:
-            token_valid = is_claude_code_token_valid(creds)
-        except (TypeError, ValueError):
-            token_valid = False
-        if not token_valid:
-            return self._usage_unavailable('token expired (run `claude` once to refresh)')
-        token = creds['accessToken']
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'anthropic-beta': 'oauth-2025-04-20',
-            'Accept': 'application/json',
-            # Mirrors Hermes's built-in Anthropic OAuth usage fetcher (agent/account_usage.py).
-            'User-Agent': 'claude-code/2.1.0',
-        }
-        try:
+            # Under core's 10 s hook deadline, so a slow API still prints a reason.
             with httpx.Client(timeout=8.0) as client:
-                response = client.get('https://api.anthropic.com/api/oauth/usage', headers=headers)
+                response = client.get(USAGE_URL, headers=headers)
         except httpx.HTTPError:
-            return self._usage_unavailable('could not reach the usage API')
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            if status in (401, 403):
-                return self._usage_unavailable('token rejected (run `claude` once to refresh)')
-            return self._usage_unavailable(f'usage API returned HTTP {status}')
+            return snapshot(reason='could not reach the usage API')
+        if response.status_code in (401, 403):
+            return snapshot(reason='token rejected (run `claude` once to refresh)')
+        if not 200 <= response.status_code < 300:
+            return snapshot(reason=f'usage API returned HTTP {response.status_code}')
         try:
             payload = response.json()
         except ValueError:
-            return self._usage_unavailable('usage API returned an unreadable response')
+            return snapshot(reason='usage API returned an unreadable response')
+        return snapshot(*usage_windows(payload if isinstance(payload, dict) else {}))
 
-        payload = payload if isinstance(payload, dict) else {}
-        limits = payload.get('limits')
-        details = []
-        if isinstance(limits, list) and limits:
-            windows = tuple(_usage_window(entry) for entry in limits if isinstance(entry, dict))
-        else:
-            # Fallback (ELI-351 AC4): no second request, no call into Hermes's built-in Anthropic
-            # fetcher (it refreshes tokens) — parse the SAME body's legacy fields instead, reusing
-            # core's own window-building helper on the already-fetched payload. The extra-usage
-            # details line is part of the legacy-field fallback only (ELI-349); the `limits` happy
-            # path (ELI-350) never surfaces it.
-            mapping = (('five_hour', 'Current session'), ('seven_day', 'Current week'),
-                       ('seven_day_opus', 'Opus week'), ('seven_day_sonnet', 'Sonnet week'))
-            # ELI-351 review round 1 findings 1 & 2: sanitize malformed window shapes/types before
-            # core's _usage_windows (which assumes a dict with a float-able utilization), then
-            # degrade any non-finite percent that survives float() to None (same as H2).
-            cleaned = _sanitize_legacy_source(payload, [key for key, _label in mapping])
-            windows = tuple(_finite_or_none(w) for w in _usage_windows(
-                cleaned, mapping, 'utilization', 'resets_at', fraction=True,
-            ))
-            extra = payload.get('extra_usage')
-            extra = extra if isinstance(extra, dict) else {}
-            used_credits, monthly_limit = extra.get('used_credits'), extra.get('monthly_limit')
-            # ELI-402: _is_num accepts NaN/Infinity (they are floats); isfinite() keeps a NaN or
-            # infinite value from rendering as "Extra usage: nan" (same bug class as H2/finding 1).
-            if (extra.get('is_enabled') and _is_num(used_credits) and _is_num(monthly_limit)
-                    and math.isfinite(used_credits) and math.isfinite(monthly_limit)):
-                details.append(f'Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {extra.get("currency") or "USD"}')
-        return AccountUsageSnapshot(
-            provider=self.name, source='oauth_usage_api', fetched_at=_utc_now(),
-            title='Claude plan limits', windows=windows, details=tuple(details),
-        )
+
+def classify_api_error(error, **_):
+    # Hermes' stale-call watchdog stops a hung call through Client.cancel(), so its kill comes back as our cancel
+    # error, which Hermes would retry as unknown: classify it as the timeout it is. A user interrupt never arrives
+    # as this error; Hermes marks its request cancelled first, drops ours and raises InterruptedError.
+    if isinstance(error, RuntimeError) and str(error) == 'Claude request cancelled':
+        return {'reason': 'timeout'}
+    return None
 
 
 profile = ClaudeOAuthDirectSDKProfile(
@@ -298,19 +208,24 @@ profile = ClaudeOAuthDirectSDKProfile(
     api_mode='chat_completions',
     auth_type='external_process',
     supports_health_check=False,
+    # Per-model only: the profile-wide supports_vision would also flip computer_use screenshots
+    # for unpinned ids to native, where the executor still treats them as text-only.
+    model_capabilities=MODEL_CAPABILITIES,
     native_reasoning_details_type='claude-subscription-directsdk-experimental.native_assistant',
     env_vars=(),
     base_url='process://claude-subscription-directsdk-experimental',
-    process_command='claude',
+    process_command=_process_command,
     process_args=(),
     process_command_env_vars=('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND',),
     default_aux_model='claude-haiku-5-5',
     fallback_models=tuple(MODEL_METADATA),
     model_aliases={alias: native_model(alias) for alias in ALIASES},
+    # A dataclass field (Hermes >= 0.21.4), so a method on the subclass would be shadowed by its None default.
+    classify_api_error=classify_api_error,
 )
 register_provider(profile)
 
 # The provider stays registered when Claude Code is missing so `hermes model` can show the
 # install hint; the request path (`directsdk.Client`) refuses with the same message.
-if _resolve(None, os.environ) is None:
+if _found is None:
     logger.warning("%s: %s", profile.display_name, INSTALL_HINT)
