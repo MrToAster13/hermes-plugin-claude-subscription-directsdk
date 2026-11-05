@@ -31,11 +31,8 @@ Install Claude Code with `npm install -g @anthropic-ai/claude-code`. `claude` is
 
 ```sh
 hermes plugins install claude-subscription-directsdk      # from the Hermes plugin catalog (pinned, reviewed)
-# or straight from GitHub (tracks main):
-hermes plugins install NousResearch/hermes-plugin-claude-subscription-directsdk
-# or, by hand:
-git clone https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk \
-    ~/.hermes/plugins/claude-subscription-directsdk-experimental
+# or straight from GitHub (tracks main of hermes-official-plugins):
+hermes plugins install NousResearch/hermes-official-plugins#claude-subscription-directsdk
 
 claude auth login
 hermes model          # pick "Claude Subscription DirectSDK (Experimental)"
